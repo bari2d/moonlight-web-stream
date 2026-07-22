@@ -1,6 +1,7 @@
 import { globalObject } from "../../util.js";
 import { Pipe, PipeInfo } from "../pipeline/index.js";
 import { addPipePassthrough } from "../pipeline/pipes.js";
+import type { StatValue } from "../stats.js";
 import { emptyVideoCodecs, maybeVideoCodecs, VideoCodecSupport } from "../video.js";
 import { getStreamRectCorrected, TrackVideoRenderer, UrlVideoRenderer, VideoRenderer, VideoRendererSetup } from "./index.js";
 
@@ -42,6 +43,143 @@ function detectCodecs(): VideoCodecSupport {
     return codecs
 }
 
+class VideoElementPlaybackStats {
+    private readonly videoElement: HTMLVideoElement
+    private frameCallbackId: number | null = null
+    private frameCallbacksRunning = false
+    private presentedFrameCallbacks = 0
+    private lastPresentedFrameAtMs: number | null = null
+    private maxPresentationGapMs = 0
+    private previousReportAtMs: number | null = null
+    private previousPresentedFrameCallbacks = 0
+    private previousTotalFrames: number | null = null
+    private previousDroppedFrames: number | null = null
+    private lastStatsReportAtMs: number | null = null
+
+    constructor(videoElement: HTMLVideoElement) {
+        this.videoElement = videoElement
+    }
+
+    private readonly onVideoFrame = () => {
+        this.frameCallbackId = null
+        if (!this.frameCallbacksRunning) {
+            return
+        }
+        const now = performance.now()
+        if (this.lastStatsReportAtMs == null || now - this.lastStatsReportAtMs > 2500) {
+            this.stop()
+            return
+        }
+        if (this.lastPresentedFrameAtMs != null) {
+            this.maxPresentationGapMs = Math.max(this.maxPresentationGapMs, now - this.lastPresentedFrameAtMs)
+        }
+        this.lastPresentedFrameAtMs = now
+        this.presentedFrameCallbacks++
+        this.scheduleFrameCallback()
+    }
+
+    start(): void {
+        this.frameCallbacksRunning = true
+        this.scheduleFrameCallback()
+    }
+
+    private scheduleFrameCallback(): void {
+        if (!this.frameCallbacksRunning) {
+            return
+        }
+        if (this.frameCallbackId != null) {
+            return
+        }
+
+        const element = this.videoElement as HTMLVideoElement & {
+            requestVideoFrameCallback?: (callback: () => void) => number
+        }
+        if (typeof element.requestVideoFrameCallback == "function") {
+            this.frameCallbackId = element.requestVideoFrameCallback(this.onVideoFrame)
+        }
+    }
+
+    stop(): void {
+        this.frameCallbacksRunning = false
+        if (this.frameCallbackId == null) {
+            return
+        }
+
+        const element = this.videoElement as HTMLVideoElement & {
+            cancelVideoFrameCallback?: (handle: number) => void
+        }
+        if (typeof element.cancelVideoFrameCallback == "function") {
+            element.cancelVideoFrameCallback(this.frameCallbackId)
+        }
+        this.frameCallbackId = null
+    }
+
+    reset(): void {
+        this.stop()
+        this.presentedFrameCallbacks = 0
+        this.lastPresentedFrameAtMs = null
+        this.maxPresentationGapMs = 0
+        this.previousReportAtMs = null
+        this.previousPresentedFrameCallbacks = 0
+        this.previousTotalFrames = null
+        this.previousDroppedFrames = null
+        this.lastStatsReportAtMs = null
+    }
+
+    report(statsObject: Record<string, StatValue>): void {
+        const now = performance.now()
+        this.lastStatsReportAtMs = now
+        this.start()
+        const reportIntervalSeconds = this.previousReportAtMs == null
+            ? null
+            : (now - this.previousReportAtMs) / 1000
+
+        if (this.lastPresentedFrameAtMs != null) {
+            statsObject.videoElementCurrentFrameAgeMs = now - this.lastPresentedFrameAtMs
+            statsObject.videoElementMaxPresentationGapMs = this.maxPresentationGapMs
+        }
+        statsObject.videoElementPresentedFrameCallbacks = this.presentedFrameCallbacks
+        statsObject.videoElementFrameCallback = typeof (
+            this.videoElement as HTMLVideoElement & { requestVideoFrameCallback?: unknown }
+        ).requestVideoFrameCallback == "function" ? "supported" : "unsupported"
+
+        if (reportIntervalSeconds != null && reportIntervalSeconds > 0 && reportIntervalSeconds <= 10) {
+            statsObject.videoElementCallbackFps = (
+                this.presentedFrameCallbacks - this.previousPresentedFrameCallbacks
+            ) / reportIntervalSeconds
+        }
+
+        if (typeof this.videoElement.getVideoPlaybackQuality == "function") {
+            const quality = this.videoElement.getVideoPlaybackQuality()
+            const totalFrames = quality.totalVideoFrames
+            const droppedFrames = quality.droppedVideoFrames
+            statsObject.videoElementTotalFrames = totalFrames
+            statsObject.videoElementDroppedFrames = droppedFrames
+
+            if (
+                reportIntervalSeconds != null && reportIntervalSeconds > 0 && reportIntervalSeconds <= 10 &&
+                this.previousTotalFrames != null && this.previousDroppedFrames != null &&
+                totalFrames >= this.previousTotalFrames && droppedFrames >= this.previousDroppedFrames
+            ) {
+                const totalFramesDelta = totalFrames - this.previousTotalFrames
+                const droppedFramesDelta = droppedFrames - this.previousDroppedFrames
+                statsObject.videoElementPresentedFps = Math.max(0, totalFramesDelta - droppedFramesDelta) / reportIntervalSeconds
+                statsObject.videoElementDroppedFps = droppedFramesDelta / reportIntervalSeconds
+                if (totalFramesDelta > 0) {
+                    statsObject.videoElementDropPercent = droppedFramesDelta * 100 / totalFramesDelta
+                }
+            }
+
+            this.previousTotalFrames = totalFrames
+            this.previousDroppedFrames = droppedFrames
+        }
+
+        this.previousReportAtMs = now
+        this.previousPresentedFrameCallbacks = this.presentedFrameCallbacks
+        this.maxPresentationGapMs = 0
+    }
+}
+
 export class VideoElementRenderer implements TrackVideoRenderer, VideoRenderer {
     static readonly type = "videotrack"
 
@@ -57,6 +195,7 @@ export class VideoElementRenderer implements TrackVideoRenderer, VideoRenderer {
     readonly implementationName: string = "video_element"
 
     private videoElement = document.createElement("video")
+    private playbackStats = new VideoElementPlaybackStats(this.videoElement)
     private oldTrack: MediaStreamTrack | null = null
     private stream = new MediaStream()
 
@@ -92,6 +231,7 @@ export class VideoElementRenderer implements TrackVideoRenderer, VideoRenderer {
         this.size = [setup.width, setup.height]
     }
     cleanup(): void {
+        this.playbackStats.stop()
         if (this.oldTrack) {
             this.stream.removeTrack(this.oldTrack)
         }
@@ -99,6 +239,7 @@ export class VideoElementRenderer implements TrackVideoRenderer, VideoRenderer {
     }
 
     setTrack(track: MediaStreamTrack): void {
+        this.playbackStats.reset()
         if (this.oldTrack) {
             this.stream.removeTrack(this.oldTrack)
         }
@@ -149,6 +290,10 @@ export class VideoElementRenderer implements TrackVideoRenderer, VideoRenderer {
         return null
     }
 
+    async reportStats(statsObject: Record<string, StatValue>): Promise<void> {
+        this.playbackStats.report(statsObject)
+    }
+
     setHdrMode(enabled: boolean): void {
         this.hdrEnabled = enabled
         // Request HDR display mode if supported
@@ -185,6 +330,7 @@ export class UrlVideoElementRenderer implements UrlVideoRenderer, VideoRenderer 
     readonly implementationName: string = "video_element"
 
     private videoElement = document.createElement("video")
+    private playbackStats = new VideoElementPlaybackStats(this.videoElement)
 
     private size: [number, number] | null = null
 
@@ -203,9 +349,12 @@ export class UrlVideoElementRenderer implements UrlVideoRenderer, VideoRenderer 
     async setup(setup: VideoRendererSetup) {
         this.size = [setup.width, setup.height]
     }
-    cleanup(): void { }
+    cleanup(): void {
+        this.playbackStats.stop()
+    }
 
     setUrl(src: string): void {
+        this.playbackStats.reset()
         this.videoElement.src = src
     }
 
@@ -249,6 +398,10 @@ export class UrlVideoElementRenderer implements UrlVideoRenderer, VideoRenderer 
 
     getBase(): Pipe | null {
         return null
+    }
+
+    async reportStats(statsObject: Record<string, StatValue>): Promise<void> {
+        this.playbackStats.report(statsObject)
     }
 
     setHdrMode(enabled: boolean): void {

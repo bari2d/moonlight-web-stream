@@ -39,6 +39,10 @@ export class WebRTCTransport implements Transport {
     private logger: Logger | null
 
     private peer: RTCPeerConnection | null = null
+    private previousInboundVideoStats: {
+        reportId: string
+        counters: Record<string, number>
+    } | null = null
 
     constructor(logger?: Logger) {
         this.logger = logger ?? null
@@ -404,12 +408,45 @@ export class WebRTCTransport implements Transport {
     async getStats(): Promise<Record<string, StatValue>> {
         const statsData: Record<string, StatValue> = {}
 
-        if (!this.videoReceiver) {
-            return {}
+        const mouseMotionChannel = this.channels[TransportChannelId.MOUSE_RELATIVE]
+        if (mouseMotionChannel instanceof WebRTCDataTransportChannel) {
+            Object.assign(statsData, mouseMotionChannel.motionDiagnostics())
         }
-        const stats = await this.videoReceiver.getStats()
 
-        for (const value of stats.values()) {
+        if (!this.videoReceiver) {
+            return statsData
+        }
+        const stats = Array.from((await this.videoReceiver.getStats()).values())
+        const inboundVideoReports = stats
+            .map(value => value as unknown as Record<string, unknown>)
+            .filter(report => (
+                report.type == "inbound-rtp" &&
+                (report.kind == "video" || report.mediaType == "video") &&
+                (typeof report.framesReceived == "number" || typeof report.framesDecoded == "number")
+            ))
+        const selectedInboundVideoReport = inboundVideoReports.reduce<Record<string, unknown> | null>(
+            (selected, candidate) => {
+                if (!selected) {
+                    return candidate
+                }
+                const score = (report: Record<string, unknown>) => {
+                    const fps = typeof report.framesPerSecond == "number" ? report.framesPerSecond : -1
+                    const decoded = typeof report.framesDecoded == "number" ? report.framesDecoded : -1
+                    return [fps, decoded]
+                }
+                const [selectedFps, selectedDecoded] = score(selected)
+                const [candidateFps, candidateDecoded] = score(candidate)
+                return candidateFps > selectedFps || (
+                    candidateFps == selectedFps && candidateDecoded > selectedDecoded
+                ) ? candidate : selected
+            },
+            null,
+        )
+        if (selectedInboundVideoReport) {
+            this.addInboundVideoIntervalStats(statsData, selectedInboundVideoReport)
+        }
+
+        for (const value of stats) {
 
             if ("decoderImplementation" in value && value.decoderImplementation != null) {
                 statsData.decoderImplementation = value.decoderImplementation
@@ -425,13 +462,13 @@ export class WebRTCTransport implements Transport {
             }
 
             if ("jitterBufferDelay" in value && value.jitterBufferDelay != null) {
-                statsData.webrtcJitterBufferDelayMs = value.jitterBufferDelay * 1000
+                statsData.webrtcJitterBufferTotalDelayMs = value.jitterBufferDelay * 1000
             }
             if ("jitterBufferTargetDelay" in value && value.jitterBufferTargetDelay != null) {
-                statsData.webrtcJitterBufferTargetDelayMs = value.jitterBufferTargetDelay * 1000
+                statsData.webrtcJitterBufferTotalTargetDelayMs = value.jitterBufferTargetDelay * 1000
             }
             if ("jitterBufferMinimumDelay" in value && value.jitterBufferMinimumDelay != null) {
-                statsData.webrtcJitterBufferMinimumDelayMs = value.jitterBufferMinimumDelay * 1000
+                statsData.webrtcJitterBufferTotalMinimumDelayMs = value.jitterBufferMinimumDelay * 1000
             }
             if ("jitter" in value && value.jitter != null) {
                 statsData.webrtcJitterMs = value.jitter * 1000
@@ -454,6 +491,21 @@ export class WebRTCTransport implements Transport {
             if ("framesDropped" in value && value.framesDropped != null) {
                 statsData.webrtcFramesDropped = value.framesDropped
             }
+            if ("framesReceived" in value && value.framesReceived != null) {
+                statsData.webrtcFramesReceived = value.framesReceived
+            }
+            if ("framesDecoded" in value && value.framesDecoded != null) {
+                statsData.webrtcFramesDecoded = value.framesDecoded
+            }
+            if ("framesRendered" in value && value.framesRendered != null) {
+                statsData.webrtcFramesRendered = value.framesRendered
+            }
+            if ("freezeCount" in value && value.freezeCount != null) {
+                statsData.webrtcFreezeCount = value.freezeCount
+            }
+            if ("totalFreezesDuration" in value && value.totalFreezesDuration != null) {
+                statsData.webrtcTotalFreezeDurationMs = value.totalFreezesDuration * 1000
+            }
             if ("keyFramesDecoded" in value && value.keyFramesDecoded != null) {
                 statsData.webrtcKeyFramesDecoded = value.keyFramesDecoded
             }
@@ -463,6 +515,120 @@ export class WebRTCTransport implements Transport {
         }
 
         return statsData
+    }
+
+    private addInboundVideoIntervalStats(
+        statsData: Record<string, StatValue>,
+        report: Record<string, unknown>,
+    ): void {
+        const counterNames = [
+            "bytesReceived",
+            "packetsReceived",
+            "packetsLost",
+            "framesReceived",
+            "framesDecoded",
+            "framesRendered",
+            "framesDropped",
+            "jitterBufferDelay",
+            "jitterBufferTargetDelay",
+            "jitterBufferMinimumDelay",
+            "jitterBufferEmittedCount",
+            "totalDecodeTime",
+            "totalProcessingDelay",
+            "totalAssemblyTime",
+            "framesAssembledFromMultiplePackets",
+            "nackCount",
+            "freezeCount",
+            "totalFreezesDuration",
+        ]
+        const timestamp = report.timestamp
+        const reportId = report.id
+        if (
+            typeof timestamp != "number" || !Number.isFinite(timestamp) ||
+            typeof reportId != "string"
+        ) {
+            return
+        }
+
+        const current: Record<string, number> = { timestamp }
+        for (const name of counterNames) {
+            const value = report[name]
+            if (typeof value == "number" && Number.isFinite(value)) {
+                current[name] = value
+            }
+        }
+
+        const previous = this.previousInboundVideoStats?.reportId == reportId
+            ? this.previousInboundVideoStats.counters
+            : null
+        this.previousInboundVideoStats = { reportId, counters: current }
+        if (!previous) {
+            return
+        }
+
+        const intervalSeconds = (current.timestamp - previous.timestamp) / 1000
+        if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0 || intervalSeconds > 10) {
+            return
+        }
+
+        const delta = (name: string): number | null => {
+            const currentValue = current[name]
+            const previousValue = previous[name]
+            if (currentValue == null || previousValue == null || currentValue < previousValue) {
+                return null
+            }
+            return currentValue - previousValue
+        }
+        const rate = (name: string): number | null => {
+            const value = delta(name)
+            return value == null ? null : value / intervalSeconds
+        }
+        const setRate = (key: string, counter: string) => {
+            const value = rate(counter)
+            if (value != null) {
+                statsData[key] = value
+            }
+        }
+        const setAverageMs = (key: string, totalCounter: string, countCounter: string) => {
+            const total = delta(totalCounter)
+            const count = delta(countCounter)
+            if (total != null && count != null && count > 0) {
+                statsData[key] = total * 1000 / count
+            }
+        }
+
+        setRate("webrtcReceiveFps", "framesReceived")
+        setRate("webrtcDecodeFps", "framesDecoded")
+        setRate("webrtcRenderFps", "framesRendered")
+        setRate("webrtcDroppedFps", "framesDropped")
+        setRate("webrtcNacksPerSecond", "nackCount")
+
+        const receivedBytes = delta("bytesReceived")
+        if (receivedBytes != null) {
+            statsData.webrtcReceiveMbps = receivedBytes * 8 / intervalSeconds / 1_000_000
+        }
+
+        const receivedPackets = delta("packetsReceived")
+        const lostPackets = delta("packetsLost")
+        if (receivedPackets != null && lostPackets != null && receivedPackets + lostPackets > 0) {
+            statsData.webrtcPacketLossPercent = lostPackets * 100 / (receivedPackets + lostPackets)
+        }
+
+        setAverageMs("webrtcJitterBufferPerFrameMs", "jitterBufferDelay", "jitterBufferEmittedCount")
+        setAverageMs("webrtcJitterTargetPerFrameMs", "jitterBufferTargetDelay", "jitterBufferEmittedCount")
+        setAverageMs("webrtcJitterMinimumPerFrameMs", "jitterBufferMinimumDelay", "jitterBufferEmittedCount")
+        setAverageMs("webrtcDecodePerFrameMs", "totalDecodeTime", "framesDecoded")
+        setAverageMs("webrtcProcessingPerFrameMs", "totalProcessingDelay", "framesDecoded")
+        setAverageMs("webrtcAssemblyPerFrameMs", "totalAssemblyTime", "framesAssembledFromMultiplePackets")
+
+        const freezes = delta("freezeCount")
+        if (freezes != null) {
+            statsData.webrtcFreezesThisInterval = freezes
+        }
+        const freezeDuration = delta("totalFreezesDuration")
+        if (freezeDuration != null) {
+            statsData.webrtcFreezeDurationThisIntervalMs = freezeDuration * 1000
+        }
     }
 }
 
@@ -561,8 +727,8 @@ const LATEST_QUEUE_POLICY: DataChannelQueuePolicy = {
 }
 const MOUSE_RELATIVE_QUEUE_POLICY: DataChannelQueuePolicy = {
     mode: "mouse-relative",
-    maxMessages: 64,
-    maxBytes: 16 * 1024,
+    maxMessages: 16,
+    maxBytes: 1024,
 }
 const MOUSE_RELATIVE_PRE_OPEN_MAX_AGE_MS = 125
 
@@ -597,6 +763,9 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
     private drainRetryTimer: number | null = null
     private queueOverflowLogged = false
     private terminalSendLogged = false
+    private peakBufferedBytes = 0
+    private peakQueuedMessages = 0
+    private coalescedMotionPackets = 0
 
     constructor(label: string, channel: RTCDataChannel | null, logger?: Logger | null) {
         this.label = label
@@ -637,7 +806,7 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
         }
 
         channel.binaryType = "arraybuffer"
-        channel.bufferedAmountLowThreshold = this.queuePolicy.mode == "latest"
+        channel.bufferedAmountLowThreshold = this.usesSingleNativeMessagePacing() || this.queuePolicy.mode == "latest"
             ? 0
             : DATA_CHANNEL_BUFFER_LOW_WATER_MARK
 
@@ -741,6 +910,7 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
             if (this.sendQueue.length == 0 && this.canSendNow(channel, message.byteLength)) {
                 try {
                     channel.send(message)
+                    this.updateBufferPeaks()
                     return
                 } catch (_error) {
                     initialSendAttempts = 1
@@ -791,6 +961,16 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
             this.removeSupersededQueuedMessages(copy)
         }
 
+        if (this.queuePolicy.mode == "mouse-relative" && sendAttempts == 0 && this.isKnownRelativeMotionPacket(copy)) {
+            const coalesced = this.coalesceQueuedRelativeMotion(copy, now, queuedBeforeOpen, sendAttempts)
+            if (coalesced != null) {
+                if (!coalesced) {
+                    this.logQueueOverflowOnce()
+                }
+                return coalesced
+            }
+        }
+
         const isTerminalInput = this.isTerminalInputMessage(copy)
         if (this.queuePolicy.mode == "fifo" && isTerminalInput) {
             while (!this.hasQueueCapacity(messageBytes, true)) {
@@ -816,7 +996,85 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
             sendAttempts,
         })
         this.queuedBytes += copy.byteLength
+        this.updateBufferPeaks()
         return true
+    }
+
+    private coalesceQueuedRelativeMotion(
+        data: ArrayBuffer,
+        now: number,
+        queuedBeforeOpen: boolean,
+        sendAttempts: number,
+    ): boolean | null {
+        let tailStart = this.sendQueue.length
+        while (
+            tailStart > 0 &&
+            this.sendQueue[tailStart - 1].queuedBeforeOpen == queuedBeforeOpen &&
+            this.sendQueue[tailStart - 1].sendAttempts == 0 &&
+            this.isKnownRelativeMotionPacket(this.sendQueue[tailStart - 1].data)
+        ) {
+            tailStart--
+        }
+        if (tailStart == this.sendQueue.length) {
+            return null
+        }
+
+        let totalX = new DataView(data).getInt16(1, false)
+        let totalY = new DataView(data).getInt16(3, false)
+        let tailBytes = 0
+        let queuedAt = now
+        let allQueuedBeforeOpen = queuedBeforeOpen
+        let maxSendAttempts = sendAttempts
+        for (let i = tailStart; i < this.sendQueue.length; i++) {
+            const queued = this.sendQueue[i]
+            const view = new DataView(queued.data)
+            totalX += view.getInt16(1, false)
+            totalY += view.getInt16(3, false)
+            tailBytes += queued.data.byteLength
+            queuedAt = Math.min(queuedAt, queued.queuedAt)
+            allQueuedBeforeOpen &&= queued.queuedBeforeOpen
+            maxSendAttempts = Math.max(maxSendAttempts, queued.sendAttempts)
+        }
+
+        const packets = this.encodeRelativeMotionPackets(totalX, totalY)
+        const prefixMessages = tailStart
+        const prefixBytes = this.queuedBytes - tailBytes
+        const replacementBytes = packets.reduce((sum, packet) => sum + packet.byteLength, 0)
+        if (
+            prefixMessages + packets.length > this.queuePolicy.maxMessages ||
+            prefixBytes + replacementBytes > this.queuePolicy.maxBytes
+        ) {
+            return false
+        }
+
+        const replacements = packets.map(packet => ({
+            data: packet,
+            queuedAt,
+            queuedBeforeOpen: allQueuedBeforeOpen,
+            sendAttempts: maxSendAttempts,
+        }))
+        this.sendQueue.splice(tailStart, this.sendQueue.length - tailStart, ...replacements)
+        this.queuedBytes = prefixBytes + replacementBytes
+        this.coalescedMotionPackets++
+        this.updateBufferPeaks()
+        return true
+    }
+
+    private encodeRelativeMotionPackets(totalX: number, totalY: number): ArrayBuffer[] {
+        const packets: ArrayBuffer[] = []
+        while (totalX != 0 || totalY != 0) {
+            const packetX = Math.max(-0x8000, Math.min(0x7fff, totalX))
+            const packetY = Math.max(-0x8000, Math.min(0x7fff, totalY))
+            const packet = new ArrayBuffer(5)
+            const view = new DataView(packet)
+            view.setUint8(0, 0)
+            view.setInt16(1, packetX, false)
+            view.setInt16(3, packetY, false)
+            packets.push(packet)
+            totalX -= packetX
+            totalY -= packetY
+        }
+        return packets
     }
 
     private tryDequeueSendQueue(): void {
@@ -862,10 +1120,20 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
             this.removeQueuedMessage(0)
             sentMessages++
             sentBytes += queued.data.byteLength
+            this.updateBufferPeaks()
+            if (this.usesSingleNativeMessagePacing()) {
+                break
+            }
         }
 
         if (this.sendQueue.length == 0) {
             this.queueOverflowLogged = false
+            this.cancelDrainRetry()
+        } else if (this.usesSingleNativeMessagePacing()) {
+            // A zero-threshold event normally wakes us as soon as the single
+            // native message drains. Some browsers miss that edge, so poll at
+            // the same short cadence without allowing another native backlog.
+            this.scheduleDrainRetry(generation)
         } else if (
             sentMessages > 0 &&
             this.canSendNow(channel, this.sendQueue[0].data.byteLength)
@@ -893,12 +1161,19 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
             return
         }
 
-        this.drainRetryTimer = window.setTimeout(() => {
-            this.drainRetryTimer = null
-            if (generation == this.channelGeneration) {
-                this.tryDequeueSendQueue()
+        const channel = this.channel
+        const timer = window.setTimeout(() => {
+            if (
+                this.drainRetryTimer !== timer ||
+                generation != this.channelGeneration ||
+                channel !== this.channel
+            ) {
+                return
             }
+            this.drainRetryTimer = null
+            this.tryDequeueSendQueue()
         }, DATA_CHANNEL_DRAIN_RETRY_MS)
+        this.drainRetryTimer = timer
     }
 
     private cancelDrainRetry(): void {
@@ -912,10 +1187,14 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
         if (messageBytes > DATA_CHANNEL_MAX_MESSAGE_BYTES) {
             return false
         }
-        if (this.queuePolicy.mode == "latest") {
+        if (this.usesSingleNativeMessagePacing() || this.queuePolicy.mode == "latest") {
             return channel.bufferedAmount == 0
         }
         return channel.bufferedAmount + messageBytes <= DATA_CHANNEL_BUFFER_HIGH_WATER_MARK
+    }
+
+    private usesSingleNativeMessagePacing(): boolean {
+        return this.queuePolicy.mode == "mouse-relative" || this.label == "mouse_absolute"
     }
 
     private hasQueueCapacity(messageBytes: number, isTerminalInput: boolean): boolean {
@@ -1047,5 +1326,24 @@ class WebRTCDataTransportChannel implements DataTransportChannel {
             return null
         }
         return (this.channel?.bufferedAmount ?? 0) + this.queuedBytes
+    }
+
+    motionDiagnostics(): Record<string, StatValue> {
+        this.updateBufferPeaks()
+        return {
+            mouseMotionBufferedBytes: this.estimatedBufferedBytes() ?? 0,
+            mouseMotionPeakBufferedBytes: this.peakBufferedBytes,
+            mouseMotionQueuedMessages: this.sendQueue.length,
+            mouseMotionPeakQueuedMessages: this.peakQueuedMessages,
+            mouseMotionCoalescedPackets: this.coalescedMotionPackets,
+        }
+    }
+
+    private updateBufferPeaks(): void {
+        this.peakBufferedBytes = Math.max(
+            this.peakBufferedBytes,
+            (this.channel?.bufferedAmount ?? 0) + this.queuedBytes,
+        )
+        this.peakQueuedMessages = Math.max(this.peakQueuedMessages, this.sendQueue.length)
     }
 }
