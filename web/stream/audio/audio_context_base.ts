@@ -60,12 +60,12 @@ export abstract class AudioContextBasePipe implements NodeAudioPlayer {
     async reportStats(statsObject: Record<string, StatValue>): Promise<void> {
         // Both values are in secs -> we convert into ms
         if (this.audioContext?.baseLatency) {
-            statsObject.audioContextBaseLatencyMs = this.audioContext.baseLatency * 100
+            statsObject.audioContextBaseLatencyMs = this.audioContext.baseLatency * 1000
         } else {
             statsObject.audioContextBaseLatencyMs = "null"
         }
         if (this.audioContext?.outputLatency) {
-            statsObject.audioContextOutputLatencyMs = this.audioContext.outputLatency * 100
+            statsObject.audioContextOutputLatencyMs = this.audioContext.outputLatency * 1000
         } else {
             statsObject.audioContextOutputLatencyMs = "null"
         }

@@ -819,6 +819,12 @@ input[type=number] {
 }
 
 /** Stream */
+body.stream #root,
+body.stream #input,
+body.stream .video-stream {
+    touch-action: none;
+}
+
 .video-stream {
     position: fixed;
     top: var(--stream-video-top, 50%);

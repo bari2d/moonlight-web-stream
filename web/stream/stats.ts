@@ -91,6 +91,8 @@ export class StreamStats {
     private transport: Transport | null = null
     private statsChannel: DataTransportChannel | null = null
     private updateIntervalId: number | null = null
+    private readonly rawDataListener = (data: ArrayBuffer) => this.onRawData(data)
+    private readonly updateLocalStatsListener = () => { void this.updateLocalStats() }
 
     private videoPipe: Pipe | null = null
     private audioPipe: Pipe | null = null
@@ -130,7 +132,7 @@ export class StreamStats {
     private checkEnabled() {
         if (this.enabled) {
             if (this.statsChannel) {
-                this.statsChannel.removeReceiveListener(this.onRawData.bind(this))
+                this.statsChannel.removeReceiveListener(this.rawDataListener)
                 this.statsChannel = null
             }
 
@@ -140,13 +142,17 @@ export class StreamStats {
                     this.logger?.debug(`Failed initialize debug transport channel because type is "${channel.type}" and not "data"`)
                     return
                 }
-                channel.addReceiveListener(this.onRawData.bind(this))
+                channel.addReceiveListener(this.rawDataListener)
                 this.statsChannel = channel
             }
             if (this.updateIntervalId == null) {
-                this.updateIntervalId = setInterval(this.updateLocalStats.bind(this), 1000)
+                this.updateIntervalId = setInterval(this.updateLocalStatsListener, 1000)
             }
         } else {
+            if (this.statsChannel) {
+                this.statsChannel.removeReceiveListener(this.rawDataListener)
+                this.statsChannel = null
+            }
             if (this.updateIntervalId != null) {
                 clearInterval(this.updateIntervalId)
                 this.updateIntervalId = null

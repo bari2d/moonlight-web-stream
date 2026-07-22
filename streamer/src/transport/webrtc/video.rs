@@ -74,6 +74,7 @@ pub struct WebRtcVideo {
     supported_video_formats: VideoFormats,
     sender: TrackLocalSender<SequencedTrackLocalStaticRTP>,
     needs_idr: Arc<AtomicBool>,
+    awaiting_idr: bool,
     clock_rate: u32,
     codec: Option<VideoCodec>,
     samples: Vec<BytesMut>,
@@ -84,6 +85,7 @@ impl WebRtcVideo {
         Self {
             clock_rate: 0,
             needs_idr: Default::default(),
+            awaiting_idr: false,
             sender: TrackLocalSender::new(runtime, peer, frame_queue_size),
             codec: None,
             supported_video_formats: VideoFormats::empty(),
@@ -215,6 +217,16 @@ impl WebRtcVideo {
     }
 
     pub async fn send_decode_unit(&mut self, unit: &VideoDecodeUnit<&[u8]>) -> DecodeResult {
+        let important = matches!(unit.frame_type, FrameType::Idr);
+
+        if self.needs_idr.swap(false, Ordering::AcqRel) {
+            self.awaiting_idr = true;
+        }
+
+        if self.awaiting_idr && !important {
+            return DecodeResult::NeedIdr;
+        }
+
         let timestamp = (unit.timestamp.as_nanos() * 90000 / 1_000_000_000) as u32;
 
         let mut full_frame = Vec::new();
@@ -222,9 +234,7 @@ impl WebRtcVideo {
             full_frame.extend_from_slice(buffer.data);
         }
 
-        let important = matches!(unit.frame_type, FrameType::Idr);
-
-        match &mut self.codec {
+        let frame_queued = match &mut self.codec {
             // -- H264
             Some(VideoCodec::H264 {
                 nal_reader,
@@ -232,7 +242,18 @@ impl WebRtcVideo {
             }) => {
                 nal_reader.reset(Cursor::new(full_frame));
 
-                while let Ok(Some(nal)) = nal_reader.next_nal() {
+                let mut frame_complete = true;
+                loop {
+                    let nal = match nal_reader.next_nal() {
+                        Ok(Some(nal)) => nal,
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!("discarding incomplete h264 frame: {err:?}");
+                            frame_complete = false;
+                            break;
+                        }
+                    };
+
                     trace!(
                         target: "video::header",
                         nal_start_code = ?nal.start_code,
@@ -241,7 +262,7 @@ impl WebRtcVideo {
                     );
                     trace!(
                         target: "video::nalu",
-                        nal_data = ?&nal.full,
+                        nal_bytes = nal.full.len(),
                         "h264 nalu"
                     );
 
@@ -258,15 +279,19 @@ impl WebRtcVideo {
                     self.samples.push(data);
                 }
 
-                send_single_frame(
-                    &mut self.samples,
-                    &mut self.sender,
-                    payloader,
-                    timestamp,
-                    important,
-                    &self.needs_idr,
-                )
-                .await;
+                if frame_complete {
+                    send_single_frame(
+                        &mut self.samples,
+                        &mut self.sender,
+                        payloader,
+                        timestamp,
+                        important,
+                    )
+                    .await
+                } else {
+                    self.samples.clear();
+                    false
+                }
             }
             // -- H265
             Some(VideoCodec::H265 {
@@ -275,7 +300,18 @@ impl WebRtcVideo {
             }) => {
                 nal_reader.reset(Cursor::new(full_frame));
 
-                while let Ok(Some(nal)) = nal_reader.next_nal() {
+                let mut frame_complete = true;
+                loop {
+                    let nal = match nal_reader.next_nal() {
+                        Ok(Some(nal)) => nal,
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!("discarding incomplete h265 frame: {err:?}");
+                            frame_complete = false;
+                            break;
+                        }
+                    };
+
                     trace!(
                         target: "video::header",
                         nal_start_code = ?nal.start_code,
@@ -284,7 +320,7 @@ impl WebRtcVideo {
                     );
                     trace!(
                         target: "video::nalu",
-                        nal_data = ?&nal.full,
+                        nal_bytes = nal.full.len(),
                         "h265 nalu"
                     );
 
@@ -296,15 +332,19 @@ impl WebRtcVideo {
                     self.samples.push(data);
                 }
 
-                send_single_frame(
-                    &mut self.samples,
-                    &mut self.sender,
-                    payloader,
-                    timestamp,
-                    important,
-                    &self.needs_idr,
-                )
-                .await;
+                if frame_complete {
+                    send_single_frame(
+                        &mut self.samples,
+                        &mut self.sender,
+                        payloader,
+                        timestamp,
+                        important,
+                    )
+                    .await
+                } else {
+                    self.samples.clear();
+                    false
+                }
             }
             // -- AV1
             Some(VideoCodec::Av1 { payloader }) => {
@@ -316,21 +356,23 @@ impl WebRtcVideo {
                     payloader,
                     timestamp,
                     important,
-                    &self.needs_idr,
                 )
-                .await;
+                .await
             }
             None => {
                 warn!("Failed to send decode unit because of missing codec!");
+                false
             }
+        };
+
+        let idr_requested = self.needs_idr.swap(false, Ordering::AcqRel);
+        if !frame_queued || idr_requested {
+            self.awaiting_idr = true;
+            return DecodeResult::NeedIdr;
         }
 
-        if self
-            .needs_idr
-            .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            return DecodeResult::NeedIdr;
+        if important {
+            self.awaiting_idr = false;
         }
 
         DecodeResult::Ok
@@ -353,46 +395,75 @@ pub fn register_video_codecs(media_engine: &mut MediaEngine) -> Result<(), webrt
     Ok(())
 }
 
-async fn send_single_frame(
+async fn send_single_frame<P>(
     samples: &mut Vec<BytesMut>,
     sender: &mut TrackLocalSender<SequencedTrackLocalStaticRTP>,
-    payloader: &mut impl Payloader,
+    payloader: &mut P,
     timestamp: u32,
     important: bool,
-    needs_idr: &AtomicBool,
-) {
-    if important {
-        sender.clear_queue(false).await;
+) -> bool
+where
+    P: Payloader + Clone,
+{
+    if samples.is_empty() {
+        warn!("discarding video frame with no codec samples");
+        return false;
     }
 
-    let mut peekable = samples.drain(..).peekable();
-
+    let frame = std::mem::take(samples);
+    let mut staged_payloader = payloader.clone();
     let mut frame_samples = Vec::new();
-    while let Some(sample) = peekable.next() {
+    for sample in frame {
+        if sample.is_empty() {
+            warn!("discarding video frame containing an empty codec sample");
+            return false;
+        }
+
         let packets = match packetize(
-            payloader,
+            &mut staged_payloader,
             RTP_OUTBOUND_MTU,
             0, // is set in the write fn
             timestamp,
             &sample.freeze(),
-            peekable.peek().is_none(),
+            false,
         ) {
             Ok(value) => value,
             Err(err) => {
-                warn!("failed to packetize packet: {err}");
-                continue;
+                warn!("discarding video frame after packetization failed: {err}");
+                return false;
             }
         };
 
         frame_samples.extend(packets);
     }
 
+    if frame_samples.is_empty() {
+        warn!("discarding video frame with no RTP packets");
+        return false;
+    }
+
+    // Some payloaders buffer codec headers and emit no packet for those input
+    // samples. Mark the final packet only after the whole access unit has been
+    // packetized so a trailing buffered header cannot leave the frame unmarked.
+    if let Some(last_packet) = frame_samples.last_mut() {
+        last_packet.header.marker = true;
+    }
+
+    if important {
+        sender
+            .replace_queued_samples(frame_samples, important)
+            .await;
+        *payloader = staged_payloader;
+        return true;
+    }
+
     if !sender.send_samples(frame_samples, important).await {
         sender.clear_queue(true).await;
-
-        // We've dropped a frame (likely due to buffering)
-        needs_idr.store(true, Ordering::Release);
+        return false;
     }
+
+    *payloader = staged_payloader;
+    true
 }
 
 fn packetize(

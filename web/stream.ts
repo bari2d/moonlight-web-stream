@@ -83,6 +83,7 @@ class ViewerApp implements Component {
     private statsDiv = document.createElement("div")
     private localTouchCursorDiv = document.createElement("div")
     private stream: Stream
+    private inputElement: HTMLDivElement
 
     private inputConfig: StreamInputConfig = defaultStreamInputConfig()
     private previousMouseMode: MouseMode
@@ -97,9 +98,40 @@ class ViewerApp implements Component {
     private hasShownFullscreenEscapeWarning = false
     private keyboardViewportBaselineHeight: number | null = null
     private streamVideoTopOffsetPx: number = 0
+    private readonly pointerEventsSupported = "PointerEvent" in window
+    private readonly pointerRawUpdateSupported = supportsUsablePointerRawUpdate()
+    private activePointers: Map<number, string> = new Map()
+    private autoFullscreenTouchPointers: Set<number> = new Set()
+
+    private cachedStreamRect = new DOMRect()
+    private streamRectRefreshFrame: number | null = null
+    private streamResizeObserver: ResizeObserver | null = null
+    private streamMutationObserver: MutationObserver | null = null
+    private readonly eventListenerAbort = new AbortController()
+    private statsUpdateInterval: number | null = null
+    private touchUpdateFrame: number | null = null
+    private gamepadUpdateFrame: number | null = null
+    private animationLoopsActive = true
+    private readonly touchUpdateFrameCallback = () => this.onTouchUpdate()
+    private readonly gamepadUpdateFrameCallback = () => this.onGamepadUpdate()
+    private readonly scheduleStreamRectRefresh = () => {
+        if (this.streamRectRefreshFrame != null) {
+            return
+        }
+        this.streamRectRefreshFrame = window.requestAnimationFrame(() => {
+            this.streamRectRefreshFrame = null
+            this.refreshStreamRect()
+        })
+    }
 
     constructor(api: Api, hostId: number, appId: number, bootstrapRole: DetailedRole) {
         this.api = api
+
+        const inputElement = document.getElementById("input")
+        if (!(inputElement instanceof HTMLDivElement)) {
+            throw new Error("stream input element not found")
+        }
+        this.inputElement = inputElement
 
         const settings = getLocalStreamSettings(bootstrapRole.default_settings)
         Object.assign(this.inputConfig, {
@@ -120,7 +152,7 @@ class ViewerApp implements Component {
         this.localTouchCursorDiv.hidden = true
         this.localTouchCursorDiv.classList.add("local-touch-cursor")
 
-        setInterval(() => {
+        this.statsUpdateInterval = window.setInterval(() => {
             // Update stats display every 100ms
             const stats = this.getStream()?.getStats()
             if (stats && stats.isEnabled()) {
@@ -146,25 +178,32 @@ class ViewerApp implements Component {
 
         this.stream = new Stream(this.api, hostId, appId, settings, [browserWidth, browserHeight], bootstrapRole.permissions)
         this.startStream(hostId, appId, bootstrapRole.permissions, settings, [browserWidth, browserHeight])
+        this.initializeStreamRectCache()
 
         // Configure input
         this.addListeners(document)
-        this.addListeners(document.getElementById("input") as HTMLDivElement)
 
+        const listenerOptions = { signal: this.eventListenerAbort.signal }
         window.addEventListener("blur", () => {
-            this.stream.getInput().raiseAllKeys()
-        })
+            this.releaseAllInputState()
+        }, listenerOptions)
         document.addEventListener("visibilitychange", () => {
             if (document.visibilityState !== "visible") {
-                this.stream.getInput().raiseAllKeys()
+                this.releaseAllInputState()
             }
-        })
+        }, listenerOptions)
+        window.addEventListener("pagehide", () => this.releaseAllInputState(), listenerOptions)
 
-        document.addEventListener("pointerlockchange", this.onPointerLockChange.bind(this))
-        document.addEventListener("fullscreenchange", this.onFullscreenChange.bind(this))
+        window.addEventListener("resize", this.scheduleStreamRectRefresh, listenerOptions)
+        window.addEventListener("orientationchange", this.scheduleStreamRectRefresh, listenerOptions)
+        window.visualViewport?.addEventListener("resize", this.scheduleStreamRectRefresh, listenerOptions)
+        window.visualViewport?.addEventListener("scroll", this.scheduleStreamRectRefresh, listenerOptions)
 
-        window.addEventListener("gamepadconnected", this.onGamepadConnect.bind(this))
-        window.addEventListener("gamepaddisconnected", this.onGamepadDisconnect.bind(this))
+        document.addEventListener("pointerlockchange", this.onPointerLockChange.bind(this), listenerOptions)
+        document.addEventListener("fullscreenchange", this.onFullscreenChange.bind(this), listenerOptions)
+
+        window.addEventListener("gamepadconnected", this.onGamepadConnect.bind(this), listenerOptions)
+        window.addEventListener("gamepaddisconnected", this.onGamepadDisconnect.bind(this), listenerOptions)
         // Connect all gamepads
         for (const gamepad of navigator.getGamepads()) {
             if (gamepad != null) {
@@ -173,20 +212,36 @@ class ViewerApp implements Component {
         }
     }
     private addListeners(element: GlobalEventHandlers) {
-        element.addEventListener("keydown", this.onKeyDown.bind(this), { passive: false })
-        element.addEventListener("keyup", this.onKeyUp.bind(this), { passive: false })
-        element.addEventListener("paste", this.onPaste.bind(this))
+        const activeOptions = { passive: false, signal: this.eventListenerAbort.signal }
+        const listenerOptions = { signal: this.eventListenerAbort.signal }
+        element.addEventListener("keydown", this.onKeyDown.bind(this), activeOptions)
+        element.addEventListener("keyup", this.onKeyUp.bind(this), activeOptions)
+        element.addEventListener("paste", this.onPaste.bind(this), listenerOptions)
 
-        element.addEventListener("mousedown", this.onMouseButtonDown.bind(this), { passive: false })
-        element.addEventListener("mouseup", this.onMouseButtonUp.bind(this), { passive: false })
-        element.addEventListener("mousemove", this.onMouseMove.bind(this), { passive: false })
-        element.addEventListener("wheel", this.onMouseWheel.bind(this), { passive: false })
-        element.addEventListener("contextmenu", this.onContextMenu.bind(this), { passive: false })
+        if (this.pointerEventsSupported) {
+            element.addEventListener("pointerdown", this.onPointerDown.bind(this), activeOptions)
+            element.addEventListener("pointerup", this.onPointerUp.bind(this), activeOptions)
+            element.addEventListener("pointercancel", this.onPointerCancel.bind(this), activeOptions)
+            element.addEventListener("lostpointercapture", this.onLostPointerCapture.bind(this), activeOptions)
 
-        element.addEventListener("touchstart", this.onTouchStart.bind(this), { passive: false })
-        element.addEventListener("touchend", this.onTouchEnd.bind(this), { passive: false })
-        element.addEventListener("touchcancel", this.onTouchCancel.bind(this), { passive: false })
-        element.addEventListener("touchmove", this.onTouchMove.bind(this), { passive: false })
+            if (this.pointerRawUpdateSupported) {
+                element.addEventListener("pointerrawupdate", this.onPointerMove.bind(this) as EventListener, activeOptions)
+            } else {
+                element.addEventListener("pointermove", this.onPointerMove.bind(this), activeOptions)
+            }
+        } else {
+            element.addEventListener("mousedown", this.onMouseButtonDown.bind(this), activeOptions)
+            element.addEventListener("mouseup", this.onMouseButtonUp.bind(this), activeOptions)
+            element.addEventListener("mousemove", this.onMouseMove.bind(this), activeOptions)
+
+            element.addEventListener("touchstart", this.onTouchStart.bind(this), activeOptions)
+            element.addEventListener("touchend", this.onTouchEnd.bind(this), activeOptions)
+            element.addEventListener("touchcancel", this.onTouchCancel.bind(this), activeOptions)
+            element.addEventListener("touchmove", this.onTouchMove.bind(this), activeOptions)
+        }
+
+        element.addEventListener("wheel", this.onMouseWheel.bind(this), activeOptions)
+        element.addEventListener("contextmenu", this.onContextMenu.bind(this), activeOptions)
     }
 
     private async startStream(hostId: number, appId: number, permissions: StreamPermissions, settings: Settings, browserSize: [number, number]) {
@@ -232,6 +287,8 @@ class ViewerApp implements Component {
             document.title = `Stream: ${app.title}`
         } else if (data.type == "connectionComplete") {
             this.sidebar.onCapabilitiesChange(data.capabilities)
+        } else if (data.type == "videoReady") {
+            this.scheduleStreamRectRefresh()
         }
     }
 
@@ -303,7 +360,10 @@ class ViewerApp implements Component {
     setInputConfig(config: StreamInputConfig) {
         Object.assign(this.inputConfig, config)
 
-        this.stream.getInput().setConfig(this.inputConfig)
+        const pointingModeChanged = this.stream.getInput().setConfig(this.inputConfig, this.getStreamRect())
+        if (pointingModeChanged) {
+            this.clearActivePointerCaptures()
+        }
         this.renderLocalTouchCursor()
     }
 
@@ -415,6 +475,147 @@ class ViewerApp implements Component {
         event.stopPropagation()
     }
 
+    // Pointer Events are used for mouse, pen, and multi-touch on supporting browsers.
+    onPointerDown(event: PointerEvent) {
+        this.capturePointer(event)
+
+        if (event.pointerType == "touch") {
+            if (this.pendingAutoFullscreenTouchGesture || this.beginAutoFullscreenTouchGesture()) {
+                this.autoFullscreenTouchPointers.add(event.pointerId)
+                event.preventDefault()
+                event.stopPropagation()
+                return
+            }
+        } else if (this.consumeAutoFullscreenInteraction()) {
+            this.pendingAutoFullscreenMouseGesture = true
+            event.preventDefault()
+            event.stopPropagation()
+            return
+        }
+
+        this.onUserInteraction()
+        event.preventDefault()
+        this.stream.getInput().onPointerDown(event, this.getStreamRect())
+        event.stopPropagation()
+    }
+
+    onPointerUp(event: PointerEvent) {
+        if (event.pointerType == "touch" && this.autoFullscreenTouchPointers.has(event.pointerId)) {
+            this.autoFullscreenTouchPointers.delete(event.pointerId)
+            this.finishPointerCapture(event.pointerId)
+            if (this.autoFullscreenTouchPointers.size == 0) {
+                this.consumeAutoFullscreenTouchGesture()
+            }
+            event.preventDefault()
+            event.stopPropagation()
+            return
+        }
+        if (event.pointerType != "touch" && this.pendingAutoFullscreenMouseGesture) {
+            this.pendingAutoFullscreenMouseGesture = false
+            this.finishPointerCapture(event.pointerId)
+            event.preventDefault()
+            event.stopPropagation()
+            return
+        }
+
+        this.onUserInteraction()
+        event.preventDefault()
+        this.stream.getInput().onPointerUp(event, this.getStreamRect())
+        this.finishPointerCapture(event.pointerId)
+        event.stopPropagation()
+    }
+
+    onPointerCancel(event: PointerEvent) {
+        const wasAutoFullscreenTouch = this.autoFullscreenTouchPointers.delete(event.pointerId)
+        if (wasAutoFullscreenTouch) {
+            if (this.autoFullscreenTouchPointers.size == 0) {
+                this.pendingAutoFullscreenTouchGesture = false
+            }
+        } else if (event.pointerType != "touch" && this.pendingAutoFullscreenMouseGesture) {
+            this.pendingAutoFullscreenMouseGesture = false
+        } else {
+            this.stream.getInput().onPointerCancel(event, this.getStreamRect())
+        }
+
+        this.finishPointerCapture(event.pointerId)
+        event.preventDefault()
+        event.stopPropagation()
+    }
+
+    onPointerMove(event: PointerEvent) {
+        if (
+            this.autoFullscreenTouchPointers.has(event.pointerId) ||
+            (event.pointerType != "touch" && this.pendingAutoFullscreenMouseGesture)
+        ) {
+            event.preventDefault()
+            event.stopPropagation()
+            return
+        }
+
+        event.preventDefault()
+        this.stream.getInput().onPointerMove(event, this.getStreamRect())
+        event.stopPropagation()
+    }
+
+    onLostPointerCapture(event: PointerEvent) {
+        if (!this.activePointers.has(event.pointerId)) {
+            return
+        }
+
+        this.activePointers.delete(event.pointerId)
+        if (this.autoFullscreenTouchPointers.delete(event.pointerId)) {
+            if (this.autoFullscreenTouchPointers.size == 0) {
+                this.pendingAutoFullscreenTouchGesture = false
+            }
+            return
+        }
+
+        this.stream.getInput().onPointerCancel(event, this.getStreamRect())
+    }
+
+    private capturePointer(event: PointerEvent) {
+        this.activePointers.set(event.pointerId, event.pointerType)
+        try {
+            this.inputElement.setPointerCapture(event.pointerId)
+        } catch {
+            // Pointer capture can fail for synthetic or already-ended pointers.
+        }
+    }
+
+    private finishPointerCapture(pointerId: number) {
+        this.activePointers.delete(pointerId)
+        try {
+            if (this.inputElement.hasPointerCapture(pointerId)) {
+                this.inputElement.releasePointerCapture(pointerId)
+            }
+        } catch {
+            // The browser may have implicitly released capture already.
+        }
+    }
+
+    private clearActivePointerCaptures() {
+        const pointerIds = Array.from(this.activePointers.keys())
+        this.activePointers.clear()
+        this.autoFullscreenTouchPointers.clear()
+        this.pendingAutoFullscreenTouchGesture = false
+        this.pendingAutoFullscreenMouseGesture = false
+
+        for (const pointerId of pointerIds) {
+            try {
+                if (this.inputElement.hasPointerCapture(pointerId)) {
+                    this.inputElement.releasePointerCapture(pointerId)
+                }
+            } catch {
+                // Ignore pointers that ended while cleanup was running.
+            }
+        }
+    }
+
+    private releaseAllInputState() {
+        this.stream.getInput().releaseAllInputs(this.getStreamRect())
+        this.clearActivePointerCaptures()
+    }
+
     // Touch
     onTouchStart(event: TouchEvent) {
         if (this.beginAutoFullscreenTouchGesture()) {
@@ -462,11 +663,14 @@ class ViewerApp implements Component {
         event.stopPropagation()
     }
     onTouchUpdate() {
+        if (!this.animationLoopsActive) {
+            return
+        }
         this.stream.getInput().onTouchUpdate(this.getStreamRect())
         this.updateKeyboardViewportVideoOffset()
         this.renderLocalTouchCursor()
 
-        window.requestAnimationFrame(this.onTouchUpdate.bind(this))
+        this.touchUpdateFrame = window.requestAnimationFrame(this.touchUpdateFrameCallback)
     }
     onTouchMove(event: TouchEvent) {
         if (this.pendingAutoFullscreenTouchGesture) {
@@ -492,9 +696,12 @@ class ViewerApp implements Component {
         this.stream.getInput().onGamepadDisconnect(event)
     }
     onGamepadUpdate() {
+        if (!this.animationLoopsActive) {
+            return
+        }
         this.stream.getInput().onGamepadUpdate()
 
-        window.requestAnimationFrame(this.onGamepadUpdate.bind(this))
+        this.gamepadUpdateFrame = window.requestAnimationFrame(this.gamepadUpdateFrameCallback)
     }
 
     // Fullscreen
@@ -564,6 +771,7 @@ class ViewerApp implements Component {
         return "fullscreenElement" in document && !!document.fullscreenElement
     }
     private async onFullscreenChange() {
+        this.scheduleStreamRectRefresh()
         if (this.isFullscreen()) {
             this.fullscreenOnNextInteractionArmed = false
             this.pendingAutoFullscreenTouchGesture = false
@@ -656,6 +864,40 @@ class ViewerApp implements Component {
         } else {
             setSidebar(this.sidebar)
         }
+    }
+    private initializeStreamRectCache() {
+        if ("ResizeObserver" in window) {
+            this.streamResizeObserver = new ResizeObserver(this.scheduleStreamRectRefresh)
+            this.streamResizeObserver.observe(document.documentElement)
+            this.streamResizeObserver.observe(this.div)
+        }
+
+        if ("MutationObserver" in window) {
+            this.streamMutationObserver = new MutationObserver(this.scheduleStreamRectRefresh)
+            this.streamMutationObserver.observe(this.div, { childList: true, subtree: true })
+        }
+
+        this.refreshStreamRect()
+    }
+    private refreshStreamRect() {
+        const renderer = this.stream.getVideoRenderer()
+        const rect = renderer?.getStreamRect()
+        if (rect && this.isUsableStreamRect(rect)) {
+            this.cachedStreamRect = new DOMRect(rect.left, rect.top, rect.width, rect.height)
+        } else if (!this.isUsableStreamRect(this.cachedStreamRect)) {
+            this.cachedStreamRect = new DOMRect()
+        }
+
+        if (this.streamResizeObserver) {
+            for (const element of this.div.querySelectorAll(".video-stream")) {
+                this.streamResizeObserver.observe(element)
+            }
+        }
+    }
+    private isUsableStreamRect(rect: DOMRect): boolean {
+        return Number.isFinite(rect.left) && Number.isFinite(rect.top) &&
+            Number.isFinite(rect.width) && Number.isFinite(rect.height) &&
+            rect.width > 0 && rect.height > 0
     }
     private renderLocalTouchCursor() {
         const localCursorState = this.stream.getInput().getLocalCursorState()
@@ -754,10 +996,12 @@ class ViewerApp implements Component {
     private applyStreamVideoTopOffset() {
         if (Math.abs(this.streamVideoTopOffsetPx) < 0.5) {
             document.documentElement.style.removeProperty("--stream-video-top")
+            this.scheduleStreamRectRefresh()
             return
         }
 
         document.documentElement.style.setProperty("--stream-video-top", `calc(50% + ${this.streamVideoTopOffsetPx}px)`)
+        this.scheduleStreamRectRefresh()
     }
     private updateKeyboardFloatingButtonPosition() {
         const screenKeyboard = this.sidebar.getScreenKeyboard()
@@ -777,15 +1021,40 @@ class ViewerApp implements Component {
 
     mount(parent: HTMLElement): void {
         parent.appendChild(this.div)
+        this.scheduleStreamRectRefresh()
     }
     unmount(parent: HTMLElement): void {
+        this.releaseAllInputState()
+        this.stream.getInput().dispose()
+        this.animationLoopsActive = false
+        this.eventListenerAbort.abort()
+        if (this.statsUpdateInterval != null) {
+            window.clearInterval(this.statsUpdateInterval)
+            this.statsUpdateInterval = null
+        }
+        if (this.touchUpdateFrame != null) {
+            window.cancelAnimationFrame(this.touchUpdateFrame)
+            this.touchUpdateFrame = null
+        }
+        if (this.gamepadUpdateFrame != null) {
+            window.cancelAnimationFrame(this.gamepadUpdateFrame)
+            this.gamepadUpdateFrame = null
+        }
+        if (this.streamRectRefreshFrame != null) {
+            window.cancelAnimationFrame(this.streamRectRefreshFrame)
+            this.streamRectRefreshFrame = null
+        }
+        this.streamResizeObserver?.disconnect()
+        this.streamMutationObserver?.disconnect()
+        window.removeEventListener("resize", this.scheduleStreamRectRefresh)
+        window.removeEventListener("orientationchange", this.scheduleStreamRectRefresh)
+        window.visualViewport?.removeEventListener("resize", this.scheduleStreamRectRefresh)
+        window.visualViewport?.removeEventListener("scroll", this.scheduleStreamRectRefresh)
         parent.removeChild(this.div)
     }
 
     getStreamRect(): DOMRect {
-        // The bounding rect of the videoElement or canvasElement can be bigger than the actual video
-        // -> We need to correct for this when sending positions, else positions are wrong
-        return this.stream.getVideoRenderer()?.getStreamRect() ?? new DOMRect()
+        return this.cachedStreamRect
     }
     getStream(): Stream | null {
         return this.stream
@@ -1217,7 +1486,24 @@ function stopPropagationOn(element: HTMLElement) {
     element.addEventListener("touchmove", onStopPropagation)
     element.addEventListener("touchend", onStopPropagation)
     element.addEventListener("touchcancel", onStopPropagation)
+    element.addEventListener("pointerdown", onStopPropagation)
+    element.addEventListener("pointerup", onStopPropagation)
+    element.addEventListener("pointermove", onStopPropagation)
+    element.addEventListener("pointerrawupdate", onStopPropagation)
+    element.addEventListener("pointercancel", onStopPropagation)
+    element.addEventListener("lostpointercapture", onStopPropagation)
 }
 function onStopPropagation(event: Event) {
     event.stopPropagation()
+}
+
+function supportsUsablePointerRawUpdate(): boolean {
+    if (!window.isSecureContext || !("onpointerrawupdate" in window)) {
+        return false
+    }
+
+    // Firefox exposed pointerrawupdate before movementX/Y worked on those
+    // events. Keep those releases on pointermove so relative input is not zero.
+    const firefoxVersion = navigator.userAgent.match(/Firefox\/(\d+)/)?.[1]
+    return firefoxVersion == null || Number.parseInt(firefoxVersion, 10) >= 148
 }

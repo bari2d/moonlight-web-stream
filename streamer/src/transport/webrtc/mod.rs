@@ -322,6 +322,24 @@ fn create_channel_message_handler(
     })
 }
 
+fn transport_channel_for_label(label: &str) -> Option<TransportChannel> {
+    let channel_id = match label {
+        "general" => TransportChannelId::GENERAL,
+        "mouse_reliable" => TransportChannelId::MOUSE_RELIABLE,
+        "mouse_absolute" => TransportChannelId::MOUSE_ABSOLUTE,
+        "mouse_relative" => TransportChannelId::MOUSE_RELATIVE,
+        "touch" => TransportChannelId::TOUCH,
+        "keyboard" => TransportChannelId::KEYBOARD,
+        "controllers" => TransportChannelId::CONTROLLERS,
+        _ => {
+            let id = label.strip_prefix("controller")?.parse::<usize>().ok()?;
+            *InboundPacket::CONTROLLER_CHANNELS.get(id)?
+        }
+    };
+
+    Some(TransportChannel(channel_id))
+}
+
 impl WebRtcInner {
     // -- Handle Connection State
     async fn on_ice_connection_state_change(self: &Arc<Self>, _state: RTCIceConnectionState) {}
@@ -501,51 +519,14 @@ impl WebRtcInner {
         debug!("adding data channel: \"{label}\"");
 
         let inner = Arc::downgrade(&self);
-
-        match label {
-            "general" => {
-                debug!("setting up general channel message handler");
-                channel.on_message(create_channel_message_handler(
-                    inner,
-                    TransportChannel(TransportChannelId::GENERAL),
-                ));
-            }
-            "mouse_reliable" | "mouse_absolute" | "mouse_relative" => {
-                channel.on_message(create_channel_message_handler(
-                    inner,
-                    TransportChannel(TransportChannelId::MOUSE_ABSOLUTE),
-                ));
-            }
-            "touch" => {
-                channel.on_message(create_channel_message_handler(
-                    inner,
-                    TransportChannel(TransportChannelId::TOUCH),
-                ));
-            }
-            "keyboard" => {
-                channel.on_message(create_channel_message_handler(
-                    inner,
-                    TransportChannel(TransportChannelId::KEYBOARD),
-                ));
-            }
-            "controllers" => {
-                channel.on_message(create_channel_message_handler(
-                    inner,
-                    TransportChannel(TransportChannelId::CONTROLLERS),
-                ));
-            }
-            _ => {
-                if let Some(number) = label.strip_prefix("controller")
-                    && let Ok(id) = number.parse::<usize>()
-                    && id < InboundPacket::CONTROLLER_CHANNELS.len()
-                {
-                    channel.on_message(create_channel_message_handler(
-                        inner,
-                        TransportChannel(InboundPacket::CONTROLLER_CHANNELS[id]),
-                    ));
-                }
-            }
+        let Some(transport_channel) = transport_channel_for_label(label) else {
+            return;
         };
+
+        if label == "general" {
+            debug!("setting up general channel message handler");
+        }
+        channel.on_message(create_channel_message_handler(inner, transport_channel));
     }
 
     // -- Termination
@@ -574,6 +555,37 @@ impl WebRtcInner {
         let mut request = self.timeout_terminate_request.lock().await;
 
         *request = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_labels_map_to_their_logical_channels() {
+        assert_eq!(
+            transport_channel_for_label("mouse_reliable").map(|channel| channel.0),
+            Some(TransportChannelId::MOUSE_RELIABLE)
+        );
+        assert_eq!(
+            transport_channel_for_label("mouse_absolute").map(|channel| channel.0),
+            Some(TransportChannelId::MOUSE_ABSOLUTE)
+        );
+        assert_eq!(
+            transport_channel_for_label("mouse_relative").map(|channel| channel.0),
+            Some(TransportChannelId::MOUSE_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn controller_label_mapping_is_bounded() {
+        assert_eq!(
+            transport_channel_for_label("controller15").map(|channel| channel.0),
+            Some(TransportChannelId::CONTROLLER15)
+        );
+        assert!(transport_channel_for_label("controller16").is_none());
+        assert!(transport_channel_for_label("controller_invalid").is_none());
     }
 }
 

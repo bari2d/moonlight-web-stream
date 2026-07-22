@@ -9,6 +9,7 @@ use log::{debug, warn};
 use tokio::{
     runtime::Handle,
     sync::{Mutex, Notify},
+    task::JoinHandle,
 };
 use webrtc::{
     api::media_engine::MediaEngine,
@@ -31,6 +32,7 @@ use webrtc::{
 };
 
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
+const MAX_CHANNEL_QUEUE_SIZE: usize = 256;
 
 pub fn register_header_extensions(api_media: &mut MediaEngine) -> Result<(), webrtc::Error> {
     api_media.register_header_extension(
@@ -73,6 +75,7 @@ where
     runtime: Handle,
     peer: Weak<RTCPeerConnection>,
     channel_queue_size: usize,
+    sample_sender_task: Option<JoinHandle<()>>,
     new_samples_notify: Arc<Notify>,
     queue: Arc<Mutex<VecDeque<FrameSamples<Track>>>>,
 }
@@ -93,7 +96,8 @@ where
         Self {
             runtime,
             peer,
-            channel_queue_size,
+            channel_queue_size: channel_queue_size.clamp(1, MAX_CHANNEL_QUEUE_SIZE),
+            sample_sender_task: None,
             new_samples_notify: Default::default(),
             queue: Default::default(),
         }
@@ -104,6 +108,10 @@ where
         track: Track,
         mut on_packet: impl FnMut(Box<dyn Packet + Send + Sync>) + Send + 'static,
     ) -> Result<(), anyhow::Error> {
+        if self.sample_sender_task.is_some() {
+            return Err(anyhow!("A sender task is already running for this track"));
+        }
+
         let Some(peer) = self.peer.upgrade() else {
             return Err(anyhow!(
                 "Failed to create track because of missing webrtc peer!"
@@ -111,17 +119,17 @@ where
         };
 
         let track = Arc::new(track);
+        let track_sender = peer.add_track(track.clone().track()).await?;
 
         let new_samples_notify = self.new_samples_notify.clone();
         let queue = Arc::downgrade(&self.queue);
-        self.runtime.spawn({
+        let sample_sender_task = self.runtime.spawn({
             let track = track.clone();
             async move {
                 sample_sender(track, &new_samples_notify, queue).await;
             }
         });
-
-        let track_sender = peer.add_track(track.track()).await?;
+        self.sample_sender_task = Some(sample_sender_task);
 
         // Read incoming RTCP packets
         // Before these packets are returned they are processed by interceptors. For things
@@ -142,21 +150,28 @@ where
     pub async fn send_samples(&self, samples: Vec<Track::Sample>, important: bool) -> bool {
         let mut queue = self.queue.lock().await;
 
-        let result = if important {
-            queue.push_front(FrameSamples { important, samples });
-            true
-        } else {
-            if queue.len() > self.channel_queue_size {
-                return false;
-            }
+        if queue.len() >= self.channel_queue_size {
+            return false;
+        }
 
-            queue.push_front(FrameSamples { important, samples });
-            true
-        };
+        queue.push_front(FrameSamples { important, samples });
+        drop(queue);
+        self.new_samples_notify.notify_one();
 
-        self.new_samples_notify.notify_waiters();
+        true
+    }
 
-        result
+    /// Atomically replaces all pending samples with a single frame.
+    ///
+    /// This is intended for video recovery frames which supersede every queued
+    /// dependent frame. Audio must continue to use [`Self::send_samples`] so its
+    /// ordering is preserved.
+    pub async fn replace_queued_samples(&self, samples: Vec<Track::Sample>, important: bool) {
+        let mut queue = self.queue.lock().await;
+        queue.clear();
+        queue.push_front(FrameSamples { important, samples });
+        drop(queue);
+        self.new_samples_notify.notify_one();
     }
 
     /// Returns if the frame will be delivered
@@ -167,6 +182,17 @@ where
             queue.clear();
         } else {
             queue.retain(|frame| frame.important);
+        }
+    }
+}
+
+impl<Track> Drop for TrackLocalSender<Track>
+where
+    Track: TrackLike,
+{
+    fn drop(&mut self) {
+        if let Some(task) = self.sample_sender_task.take() {
+            task.abort();
         }
     }
 }
@@ -182,7 +208,7 @@ async fn sample_sender<Track>(
         let frame = {
             let Some(queue) = queue.upgrade() else {
                 debug!("no sample queue available: stopping to submit samples");
-                continue;
+                break;
             };
 
             let mut queue = queue.lock().await;
@@ -299,5 +325,52 @@ impl TrackLike for SequencedTrackLocalStaticRTP {
 
     fn track(self: Arc<Self>) -> Arc<dyn TrackLocal + Send + Sync + 'static> {
         self.track.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_capacity_is_clamped_and_enforced_exactly() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
+
+        runtime.block_on(async {
+            let minimum =
+                TrackLocalSender::<TrackLocalStaticSample>::new(Handle::current(), Weak::new(), 0);
+            assert_eq!(minimum.channel_queue_size, 1);
+
+            assert!(minimum.send_samples(vec![Sample::default()], false).await);
+            assert!(!minimum.send_samples(vec![Sample::default()], false).await);
+            assert_eq!(minimum.queue.lock().await.len(), 1);
+
+            let maximum = TrackLocalSender::<TrackLocalStaticSample>::new(
+                Handle::current(),
+                Weak::new(),
+                usize::MAX,
+            );
+            assert_eq!(maximum.channel_queue_size, MAX_CHANNEL_QUEUE_SIZE);
+        });
+    }
+
+    #[test]
+    fn replacing_samples_discards_every_pending_frame_atomically() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
+
+        runtime.block_on(async {
+            let sender =
+                TrackLocalSender::<TrackLocalStaticSample>::new(Handle::current(), Weak::new(), 4);
+
+            assert!(sender.send_samples(vec![Sample::default()], false).await);
+            assert!(sender.send_samples(vec![Sample::default()], false).await);
+            sender
+                .replace_queued_samples(vec![Sample::default()], true)
+                .await;
+
+            let queue = sender.queue.lock().await;
+            assert_eq!(queue.len(), 1);
+            assert!(queue.front().is_some_and(|frame| frame.important));
+        });
     }
 }

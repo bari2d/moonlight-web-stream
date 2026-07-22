@@ -21,7 +21,15 @@ where
 
     pub fn next_nal(&mut self) -> Result<Option<Nal>, io::Error> {
         if let Some(annex_b) = self.annex_b.next()? {
-            let header_range = annex_b.payload_range.start..(annex_b.payload_range.start + 1);
+            if annex_b.payload_range.len() < NalHeader::SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "h264 NAL is shorter than its header",
+                ));
+            }
+
+            let header_range =
+                annex_b.payload_range.start..(annex_b.payload_range.start + NalHeader::SIZE);
 
             let mut header = [0u8; 1];
             header.copy_from_slice(&annex_b.full[header_range.clone()]);
@@ -44,5 +52,18 @@ where
 
     pub fn reset(&mut self, new_reader: R) {
         self.annex_b.reset(new_reader);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn short_nal_returns_invalid_data() {
+        let mut reader = H264Reader::new(Cursor::new(vec![0, 0, 1]), 8);
+        let error = reader.next_nal().err().expect("empty NAL must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

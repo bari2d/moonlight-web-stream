@@ -172,7 +172,15 @@ where
     /// The BytesMut contains the annex-b start code
     pub fn next_nal(&mut self) -> Result<Option<Nal>, io::Error> {
         if let Some(annex_b) = self.annex_b.next()? {
-            let header_range = annex_b.payload_range.start..(annex_b.payload_range.start + 2);
+            if annex_b.payload_range.len() < NalHeader::SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "h265 NAL is shorter than its header",
+                ));
+            }
+
+            let header_range =
+                annex_b.payload_range.start..(annex_b.payload_range.start + NalHeader::SIZE);
 
             let mut header = [0u8; 2];
             header.copy_from_slice(&annex_b.full[header_range.clone()]);
@@ -201,6 +209,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn short_nal_returns_invalid_data() {
+        let mut reader = H265Reader::new(Cursor::new(vec![0, 0, 1, 0x40]), 8);
+        let error = reader
+            .next_nal()
+            .err()
+            .expect("one-byte NAL must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_parse_forbidden_zero_bit() {

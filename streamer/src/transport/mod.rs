@@ -133,6 +133,25 @@ impl InboundPacket {
         TransportChannelId::CONTROLLER15,
     ];
 
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::General { .. } => "general",
+            Self::MouseMove { .. } => "mouse_move",
+            Self::MousePosition { .. } => "mouse_position",
+            Self::MouseButton { .. } => "mouse_button",
+            Self::HighResScroll { .. } => "high_res_scroll",
+            Self::Scroll { .. } => "scroll",
+            Self::Key { .. } => "key",
+            Self::Text { .. } => "text",
+            Self::ControllerConnected { .. } => "controller_connected",
+            Self::ControllerDisconnected { .. } => "controller_disconnected",
+            Self::ControllerState { .. } => "controller_state",
+            Self::Touch { .. } => "touch",
+            Self::Rtt { .. } => "rtt",
+            Self::RequestVideoIdr => "request_video_idr",
+        }
+    }
+
     pub fn deserialize(channel: TransportChannel, bytes: &[u8]) -> Option<Self> {
         let mut buffer = ByteBuffer::new(bytes);
 
@@ -335,7 +354,8 @@ impl InboundPacket {
                 let event_type = match buffer.get_u8() {
                     0 => TouchEventType::Down,
                     1 => TouchEventType::Move,
-                    2 => TouchEventType::Cancel,
+                    2 => TouchEventType::Up,
+                    3 => TouchEventType::Cancel,
                     _ => {
                         warn!("[InboundPacket]: received invalid touch event type");
                         return None;
@@ -472,6 +492,11 @@ impl InboundPacket {
                 }
             }
             TransportChannel(TransportChannelId::RTT) => {
+                if buffer.remaining() < 1 {
+                    warn!("[InboundPacket]: failed to read RTT message");
+                    return None;
+                }
+
                 let ty = buffer.get_u8();
 
                 if ty == 0 {
@@ -643,4 +668,66 @@ pub trait TransportSender {
     async fn on_ipc_message(&self, message: ServerIpcMessage) -> Result<(), TransportError>;
 
     async fn close(&self) -> Result<(), TransportError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch_packet(event_type: u8) -> Vec<u8> {
+        let mut packet = vec![event_type];
+        packet.resize(27, 0);
+        packet
+    }
+
+    #[test]
+    fn touch_wire_values_decode_to_distinct_phases() {
+        assert!(matches!(
+            InboundPacket::deserialize(
+                TransportChannel(TransportChannelId::TOUCH),
+                &touch_packet(0),
+            ),
+            Some(InboundPacket::Touch {
+                event_type: TouchEventType::Down,
+                ..
+            })
+        ));
+        assert!(matches!(
+            InboundPacket::deserialize(
+                TransportChannel(TransportChannelId::TOUCH),
+                &touch_packet(1),
+            ),
+            Some(InboundPacket::Touch {
+                event_type: TouchEventType::Move,
+                ..
+            })
+        ));
+        assert!(matches!(
+            InboundPacket::deserialize(
+                TransportChannel(TransportChannelId::TOUCH),
+                &touch_packet(2),
+            ),
+            Some(InboundPacket::Touch {
+                event_type: TouchEventType::Up,
+                ..
+            })
+        ));
+        assert!(matches!(
+            InboundPacket::deserialize(
+                TransportChannel(TransportChannelId::TOUCH),
+                &touch_packet(3),
+            ),
+            Some(InboundPacket::Touch {
+                event_type: TouchEventType::Cancel,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_rtt_packet_is_rejected_without_panicking() {
+        assert!(
+            InboundPacket::deserialize(TransportChannel(TransportChannelId::RTT), &[]).is_none()
+        );
+    }
 }

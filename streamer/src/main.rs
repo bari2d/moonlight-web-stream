@@ -348,7 +348,7 @@ impl StreamConnection {
                 loop {
                     trace!("Polling new transport event");
                     let event = events.poll_event().await;
-                    trace!("Polled transport event: {event:?}");
+                    trace!("Polled transport event");
 
                     match event {
                         Ok(TransportEvent::SendIpc(message)) => {
@@ -442,7 +442,7 @@ impl StreamConnection {
     }
 
     async fn on_packet(&self, packet: InboundPacket) {
-        trace!(packet = ?packet, "received packet from client");
+        trace!(packet = packet.kind(), "received packet from client");
 
         let stream_lock = self.stream.read().await;
         let Some(stream) = stream_lock.as_ref() else {
@@ -875,6 +875,7 @@ impl StreamConnection {
 
         let mut stream_guard = self.stream.write().await;
         stream_guard.replace(stream);
+        drop(stream_guard);
 
         {
             let mut sender = self.transport_sender.lock().await;
