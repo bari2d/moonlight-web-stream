@@ -12,6 +12,7 @@ import { gatherPipeInfo } from "./pipeline/index.js"
 import { StreamStats } from "./stats.js"
 import { Transport, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
+import { WebTransportTransport } from "./transport/web_transport.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
 import { allVideoCodecs, andVideoCodecs, createSupportedVideoFormatsBits, emptyVideoCodecs, getSelectedVideoCodec, hasAnyCodec, VideoCodecSupport } from "./video.js"
 import { VideoRenderer } from "./video/index.js"
@@ -88,6 +89,7 @@ function isFirefox(): boolean {
 }
 
 const WEBRTC_CONNECT_TIMEOUT_MS = 15000
+const WEBTRANSPORT_CONNECT_TIMEOUT_MS = 3000
 const FALLBACK_RECONNECT_DELAY_MS = 500
 
 export class Stream implements Component {
@@ -106,6 +108,7 @@ export class Stream implements Component {
 
     private ws: WebSocket
     private iceServers: Array<RTCIceServer> | null = null
+    private webTransportUrl: string | null = null
     private transportOverride: TransportType | null = null
 
     private videoRenderer: VideoRenderer | null = null
@@ -267,6 +270,11 @@ export class Stream implements Component {
 
             this.debugLog(`ConnectionTerminated with code ${code}`, { type: "fatalDescription" })
         }
+        // The authenticated control socket provides a one-time WebTransport URL
+        // before the streamer Setup message triggers transport selection.
+        else if ("WebTransportSetup" in message) {
+            this.webTransportUrl = message.WebTransportSetup.url
+        }
         // -- WebRTC Config
         else if ("Setup" in message) {
             const iceServers = message.Setup.ice_servers
@@ -298,17 +306,29 @@ export class Stream implements Component {
         this.debugLog(`Using transport: ${desiredTransport}`)
 
         if (desiredTransport == "auto") {
-            let shutdownReason = await this.tryWebRTCTransport()
+            const shutdownReason = await this.tryWebTransport()
 
-            if (shutdownReason == "failednoconnect") {
-                this.debugLog("Failed to establish WebRTC connection. Falling back to Web Socket transport.", { type: "ifErrorDescription" })
+            if (shutdownReason == "failednoconnect" || shutdownReason == "failed" || shutdownReason == "disconnect") {
+                this.debugLog("WebTransport is unavailable or disconnected. Falling back to WebSocket transport.", { type: "ifErrorDescription" })
+                await this.restartWithFreshTransportFallback("websocket")
+                return
+            }
+        } else if (desiredTransport == "webtransport") {
+            const shutdownReason = await this.tryWebTransport()
+            if (shutdownReason == "failed" || shutdownReason == "disconnect") {
+                this.debugLog("WebTransport disconnected. Falling back to WebSocket transport.", { type: "ifErrorDescription" })
                 await this.restartWithFreshTransportFallback("websocket")
                 return
             }
         } else if (desiredTransport == "webrtc") {
             await this.tryWebRTCTransport()
         } else if (desiredTransport == "websocket") {
-            await this.tryWebSocketTransport()
+            const shutdownReason = await this.tryWebSocketTransport()
+            if (shutdownReason == "failed") {
+                this.debugLog("WebSocket transport failed. Reconnecting with a fresh control socket.", { type: "ifErrorDescription" })
+                await this.restartWithFreshTransportFallback("websocket")
+                return
+            }
         }
 
         this.debugLog("Tried all configured transport options but no connection was possible", { type: "fatal" })
@@ -369,8 +389,10 @@ export class Stream implements Component {
         this.wsSendBuffer.length = 0
         const oldWs = this.ws
 
-        if (oldWs.readyState == WebSocket.OPEN || oldWs.readyState == WebSocket.CONNECTING) {
-            oldWs.close()
+        if (oldWs.readyState != WebSocket.CLOSED) {
+            if (oldWs.readyState == WebSocket.OPEN || oldWs.readyState == WebSocket.CONNECTING) {
+                oldWs.close()
+            }
             await new Promise<void>((resolve) => {
                 const timeout = window.setTimeout(() => resolve(), 1000)
                 oldWs.addEventListener("close", () => {
@@ -565,10 +587,57 @@ export class Stream implements Component {
             }
         })
     }
-    private async tryWebSocketTransport() {
+    private async tryWebTransport(): Promise<TransportShutdown> {
+        if (!this.permissions.allow_transport_websockets) {
+            this.debugLog("Not trying WebTransport because permissions disallow browser relay transports")
+            return "failednoconnect"
+        }
+        if (!this.webTransportUrl) {
+            this.debugLog("WebTransport is not enabled on this server")
+            return "failednoconnect"
+        }
+        if (!WebTransportTransport.isSupported()) {
+            this.debugLog("This browser does not support WebTransport")
+            return "failednoconnect"
+        }
+
+        this.debugLog("Trying WebTransport")
+        const transport = new WebTransportTransport(this.webTransportUrl, this.logger)
+        let resolveShutdown: (shutdown: TransportShutdown) => void = () => {}
+        const shutdown = new Promise<TransportShutdown>((resolve) => {
+            resolveShutdown = resolve
+        })
+        transport.onclose = resolveShutdown
+
+        try {
+            await transport.connect(WEBTRANSPORT_CONNECT_TIMEOUT_MS)
+        } catch (error) {
+            this.debugLog(`WebTransport connection failed: ${error instanceof Error ? error.message : String(error)}`)
+            await transport.close()
+            return "failednoconnect"
+        }
+
+        // Selecting the relay before QUIC is ready can strand the streamer on a
+        // transport the browser cannot receive. Only switch after ready resolves.
+        this.sendWsMessage({
+            SetTransport: "WebTransport"
+        })
+        this.setTransport(transport)
+
+        const videoCodecSupport = await this.createPipelines()
+        if (!videoCodecSupport) {
+            this.debugLog("Failed to start WebTransport because no supported video pipeline was found", { type: "fatalDescription" })
+            await transport.close()
+            return "failednoconnect"
+        }
+
+        await this.startStream(videoCodecSupport)
+        return shutdown
+    }
+    private async tryWebSocketTransport(): Promise<TransportShutdown | null> {
         if (!this.permissions.allow_transport_websockets) {
             this.debugLog("Not trying WebSocket transport becaues permissions disallow it")
-            return
+            return null
         }
 
         this.debugLog("Trying Web Socket transport")
@@ -578,22 +647,24 @@ export class Stream implements Component {
         })
 
         const transport = new WebSocketTransport(this.ws, BIG_BUFFER, this.logger)
+        let resolveShutdown: (shutdown: TransportShutdown) => void = () => {}
+        const shutdown = new Promise<TransportShutdown>((resolve) => {
+            resolveShutdown = resolve
+        })
+        transport.onclose = resolveShutdown
 
         this.setTransport(transport)
 
         const videoCodecSupport = await this.createPipelines()
         if (!videoCodecSupport) {
             this.debugLog("Failed to start stream because no video pipeline with support for the specified codec was found!", { type: "fatalDescription" })
-            return
+            await transport.close()
+            return null
         }
 
         await this.startStream(videoCodecSupport)
 
-        return new Promise((resolve) => {
-            transport.onclose = (shutdown) => {
-                resolve(shutdown)
-            }
-        })
+        return shutdown
     }
 
     private async createPipelines(): Promise<VideoCodecSupport | null> {

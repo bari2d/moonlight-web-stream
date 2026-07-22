@@ -91,6 +91,7 @@ export class StreamStats {
     private transport: Transport | null = null
     private statsChannel: DataTransportChannel | null = null
     private updateIntervalId: number | null = null
+    private localStatsUpdateRunning = false
     private readonly rawDataListener = (data: ArrayBuffer) => this.onRawData(data)
     private readonly updateLocalStatsListener = () => { void this.updateLocalStats() }
 
@@ -209,11 +210,22 @@ export class StreamStats {
     }
 
     private async updateLocalStats() {
-        Promise.all([
-            this.updateTransportStats(),
-            this.updateVideoStats(),
-            this.updateAudioStats(),
-        ])
+        if (this.localStatsUpdateRunning) {
+            return
+        }
+
+        this.localStatsUpdateRunning = true
+        try {
+            await Promise.all([
+                this.updateTransportStats(),
+                this.updateVideoStats(),
+                this.updateAudioStats(),
+            ])
+        } catch (error) {
+            this.logger?.debug(`Failed to collect local stream statistics: ${String(error)}`)
+        } finally {
+            this.localStatsUpdateRunning = false
+        }
     }
     private async updateTransportStats() {
         if (!this.transport) {
@@ -232,7 +244,7 @@ export class StreamStats {
         const stats = {}
 
         if (this.videoPipe && this.videoPipe.reportStats) {
-            this.videoPipe.reportStats(stats)
+            await this.videoPipe.reportStats(stats)
         }
 
         this.statsData.video = stats
@@ -241,7 +253,7 @@ export class StreamStats {
         const stats = {}
 
         if (this.audioPipe && this.audioPipe.reportStats) {
-            this.audioPipe.reportStats(stats)
+            await this.audioPipe.reportStats(stats)
         }
 
         this.statsData.audio = stats

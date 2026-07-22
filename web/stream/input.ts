@@ -30,6 +30,7 @@ const CONTROLLER_STATE_REFRESH_INTERVAL_MS = 250
 const I16_MIN = -I16_MAX - 1
 const MAX_RELATIVE_MOUSE_CHUNKS = 64
 const RELATIVE_MOUSE_FLUSH_INTERVAL_MS = 4
+const MAX_TEXT_PACKET_BYTES = U8_MAX
 
 const TOUCH_EVENT_DOWN = 0
 const TOUCH_EVENT_MOVE = 1
@@ -84,6 +85,30 @@ function trySendChannel(channel: DataTransportChannel | null, buffer: ByteBuffer
         throw "illegal buffer size"
     }
     channel.send(readBuffer.buffer)
+}
+
+function* encodeTextChunks(text: string): Generator<Uint8Array> {
+    const encoded = new TextEncoder().encode(text)
+    if (encoded.length == 0) {
+        yield encoded
+        return
+    }
+
+    let start = 0
+    while (start < encoded.length) {
+        let end = Math.min(start + MAX_TEXT_PACKET_BYTES, encoded.length)
+
+        // Each packet is decoded independently on the streamer, so keep UTF-8
+        // code points intact when the byte limit falls in the middle of one.
+        if (end < encoded.length) {
+            while (end > start && (encoded[end] & 0xc0) == 0x80) {
+                end--
+            }
+        }
+
+        yield encoded.subarray(start, end)
+        start = end
+    }
 }
 
 export type MouseScrollMode = "highres" | "normal"
@@ -305,14 +330,15 @@ export class StreamInput {
         trySendChannel(this.keyboard, this.buffer)
     }
     sendText(text: string) {
-        this.buffer.reset()
+        for (const chunk of encodeTextChunks(text)) {
+            this.buffer.reset()
 
-        this.buffer.putU8(1)
+            this.buffer.putU8(1)
+            this.buffer.putU8(chunk.length)
+            this.buffer.putU8Array(chunk)
 
-        this.buffer.putU8(text.length)
-        this.buffer.putUtf8Raw(text)
-
-        trySendChannel(this.keyboard, this.buffer)
+            trySendChannel(this.keyboard, this.buffer)
+        }
     }
 
     // -- Mouse
@@ -976,6 +1002,10 @@ export class StreamInput {
         }
     }
 
+    hasActiveTouches(): boolean {
+        return this.touchTracker.size > 0
+    }
+
     onTouchMove(event: TouchEvent, rect: DOMRect) {
         this.onTouchSamplesMove(this.touchSamplesFromTouchEvent(event), rect)
     }
@@ -1518,7 +1548,7 @@ export class StreamInput {
         }
 
         // Reset rumble
-        this.gamepadRumbleCurrent[0] = { lowFrequencyMotor: 0, highFrequencyMotor: 0, leftTrigger: 0, rightTrigger: 0 }
+        this.gamepadRumbleCurrent[gamepad.index] = this.emptyGamepadRumbleState()
 
         let capabilities = 0
 
@@ -1529,22 +1559,22 @@ export class StreamInput {
 
                 for (const effect of supportedEffects) {
                     if (effect == "dual-rumble") {
-                        capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE
+                        capabilities |= StreamControllerCapabilities.CAPABILITY_RUMBLE
                     } else if (effect == "trigger-rumble") {
-                        capabilities = StreamControllerCapabilities.CAPABILITY_TRIGGER_RUMBLE
+                        capabilities |= StreamControllerCapabilities.CAPABILITY_TRIGGER_RUMBLE
                     }
                 }
             } else if ("type" in actuator && (actuator.type == "vibration" || actuator.type == "dual-rumble")) {
-                capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE
+                capabilities |= StreamControllerCapabilities.CAPABILITY_RUMBLE
             } else if ("playEffect" in actuator && typeof actuator.playEffect == "function") {
                 // we're just hoping at this point
-                capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE | StreamControllerCapabilities.CAPABILITY_TRIGGER_RUMBLE
+                capabilities |= StreamControllerCapabilities.CAPABILITY_RUMBLE | StreamControllerCapabilities.CAPABILITY_TRIGGER_RUMBLE
             } else if ("pulse" in actuator && typeof actuator.pulse == "function") {
-                capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE
+                capabilities |= StreamControllerCapabilities.CAPABILITY_RUMBLE
             }
         }
 
-        this.sendControllerAdd(this.gamepads.length - 1, SUPPORTED_BUTTONS, capabilities)
+        this.sendControllerAdd(id, SUPPORTED_BUTTONS, capabilities)
 
         if (gamepad.mapping != "standard") {
             console.warn(`[Gamepad]: Unable to read values of gamepad with mapping ${gamepad.mapping}`)
@@ -1646,11 +1676,15 @@ export class StreamInput {
         leftTrigger: number, rightTrigger: number
     }> = []
 
+    private emptyGamepadRumbleState() {
+        return { lowFrequencyMotor: 0, highFrequencyMotor: 0, leftTrigger: 0, rightTrigger: 0 }
+    }
+
     private setGamepadEffect(id: number, ty: "dual-rumble", params: { lowFrequencyMotor: number, highFrequencyMotor: number }): void
     private setGamepadEffect(id: number, ty: "trigger-rumble", params: { leftTrigger: number, rightTrigger: number }): void
 
     private setGamepadEffect(id: number, _ty: "dual-rumble" | "trigger-rumble", params: { lowFrequencyMotor: number, highFrequencyMotor: number } | { leftTrigger: number, rightTrigger: number }) {
-        const rumble = this.gamepadRumbleCurrent[id]
+        const rumble = this.gamepadRumbleCurrent[id] ??= this.emptyGamepadRumbleState()
 
         Object.assign(rumble, params)
     }

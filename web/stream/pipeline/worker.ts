@@ -32,10 +32,10 @@ class WorkerMessageSender implements WorkerReceiver {
     constructor(logger?: Logger) {
     }
 
-    onWorkerMessage(output: WorkerMessage): void {
+    onWorkerMessage(output: WorkerMessage, transferable?: Transferable[]): void {
         const message: ToMainMessage = { output }
 
-        postMessage(message)
+        postMessage(message, { transfer: transferable ?? [] })
     }
 
     getBase(): Pipe | null {
@@ -83,7 +83,7 @@ async function onMessage(message: ToWorkerMessage) {
 
         const pipeline = message.createPipeline
 
-        const newPipeline = buildPipeline(WorkerMessageSender, pipeline, logger)
+        const newPipeline = buildPipeline(WorkerMessageSender, pipeline, logger, pipeline.options)
         if (newPipeline && "onWorkerMessage" in newPipeline && typeof newPipeline.onWorkerMessage == "function") {
             currentPipeline = newPipeline as WorkerReceiver
         } else {

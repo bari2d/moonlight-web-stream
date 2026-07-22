@@ -117,7 +117,8 @@ export class BaseCanvasVideoRenderer implements CanvasRenderer {
         }
     }
     setCanvasSize(width: number, height: number): void {
-        if (this.canvas && !this.isTransferred) {
+        if (this.canvas && !this.isTransferred &&
+            (this.canvas.width != width || this.canvas.height != height)) {
             this.canvas.width = width
             this.canvas.height = height
         }

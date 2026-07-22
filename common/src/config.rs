@@ -20,6 +20,8 @@ pub struct Config {
     #[serde(default)]
     pub webrtc: WebRtcConfig,
     #[serde(default)]
+    pub web_transport: WebTransportConfig,
+    #[serde(default)]
     pub web_server: WebServerConfig,
     #[serde(default)]
     pub moonlight: MoonlightConfig,
@@ -41,11 +43,54 @@ impl Default for Config {
             web_server: Default::default(),
             moonlight: Default::default(),
             webrtc: Default::default(),
+            web_transport: Default::default(),
             log: Default::default(),
             #[allow(deprecated)]
             default_settings: Default::default(),
         }
     }
+}
+
+// -- WebTransport Config
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebTransportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_web_transport_bind_address")]
+    pub bind_address: SocketAddr,
+    #[serde(default)]
+    pub public_url: String,
+    #[serde(default)]
+    pub certificate_pem: String,
+    #[serde(default)]
+    pub private_key_pem: String,
+    #[serde(default = "default_web_transport_token_ttl")]
+    pub token_ttl: Duration,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: default_web_transport_bind_address(),
+            public_url: String::new(),
+            certificate_pem: String::new(),
+            private_key_pem: String::new(),
+            token_ttl: default_web_transport_token_ttl(),
+        }
+    }
+}
+
+fn default_web_transport_bind_address() -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 443))
+}
+
+fn default_web_transport_token_ttl() -> Duration {
+    // Registration is normally delayed until streamer Setup, but leave enough
+    // headroom for slow or heavily managed browsers to complete the QUIC
+    // handshake without making the bearer credential long-lived.
+    Duration::from_secs(60)
 }
 
 // -- Log
@@ -341,4 +386,37 @@ fn default_pair_device_name() -> String {
 
 fn default_streamer_path() -> String {
     "./streamer".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::{net::SocketAddr, time::Duration};
+
+    #[test]
+    fn legacy_config_without_web_transport_uses_safe_defaults() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+
+        assert!(!config.web_transport.enabled);
+        assert_eq!(
+            config.web_transport.bind_address,
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+        );
+        assert!(config.web_transport.public_url.is_empty());
+        assert!(config.web_transport.certificate_pem.is_empty());
+        assert!(config.web_transport.private_key_pem.is_empty());
+        assert_eq!(config.web_transport.token_ttl, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn partial_web_transport_config_keeps_field_defaults() {
+        let config: Config = serde_json::from_str(r#"{"web_transport":{"enabled":true}}"#).unwrap();
+
+        assert!(config.web_transport.enabled);
+        assert_eq!(
+            config.web_transport.bind_address,
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.web_transport.token_ttl, Duration::from_secs(60));
+    }
 }

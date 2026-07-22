@@ -38,7 +38,7 @@ const trueDefaultSettings: Settings =
         // possible values: null or a number, example: 60, 120
         "sendIntervalOverride": null
     },
-    // possible values: "auto", "webrtc", "websocket"
+    // possible values: "auto", "webtransport", "webrtc", "websocket"
     "dataTransport": "auto",
     "language": "en",
     "enterFullscreenOnStreamStart": false,

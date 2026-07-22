@@ -80,10 +80,10 @@ export class OpenH264DecoderPipe implements DataVideoRenderer {
 
         // TODO: add this into the decoder api
         this.lastTimestamp = unit.timestampMicroseconds
-        this.lastDuration = unit.timestampMicroseconds
+        this.lastDuration = unit.durationMicroseconds
 
         try {
-            this.decoder?.decode(new Uint8Array(unit.data))
+            this.decoder?.decode(unit.data)
         } catch (e: any) {
             console.error(e)
             this.logger?.debug(`Error whilst decoding frame using h264: ${"toString" in e && typeof e.toString == "function" ? e.toString() : e}`, { type: "fatalDescription" })

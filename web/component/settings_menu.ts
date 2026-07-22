@@ -37,7 +37,7 @@ export type Settings = {
 }
 
 export type StreamCodec = "h264" | "auto" | "h265" | "av1"
-export type TransportType = "auto" | "webrtc" | "websocket"
+export type TransportType = "auto" | "webtransport" | "webrtc" | "websocket"
 
 import DEFAULT_SETTINGS from "../default_settings.js"
 import { StreamPermissions } from "../api_bindings.js";
@@ -109,6 +109,12 @@ export function setLocalStreamSettings(settings?: Settings) {
 export type StreamSettingsChangeListener = (event: ComponentEvent<StreamSettingsComponent>) => void
 
 function makeSettingsValid(permissions: StreamPermissions, settings: Settings) {
+    // This low-latency fork no longer auto-selects or exposes WebRTC. Migrate a
+    // previously saved WebRTC choice to the new WebTransport-first Auto mode.
+    if (settings.dataTransport == "webrtc") {
+        settings.dataTransport = "auto"
+    }
+
     if (permissions.maximum_bitrate_kbps != null && permissions.maximum_bitrate_kbps < settings.bitrate) {
         settings.bitrate = permissions.maximum_bitrate_kbps
     }
@@ -127,10 +133,10 @@ function makeSettingsValid(permissions: StreamPermissions, settings: Settings) {
         settings.hdr = false
     }
 
-    if (!permissions.allow_transport_webrtc && settings.dataTransport == "webrtc") {
+    if (!permissions.allow_transport_websockets && settings.dataTransport == "websocket") {
         settings.dataTransport = "auto"
     }
-    if (!permissions.allow_transport_websockets && settings.dataTransport == "websocket") {
+    if (!permissions.allow_transport_websockets && settings.dataTransport == "webtransport") {
         settings.dataTransport = "auto"
     }
 
@@ -472,13 +478,9 @@ export class StreamSettingsComponent implements Component {
         const allowedDataTransport = [
             { value: "auto", name: i.auto },
         ]
-        if (this.permissions.allow_transport_webrtc) {
-            allowedDataTransport.push(
-                { value: "webrtc", name: "WebRTC" },
-            )
-        }
         if (this.permissions.allow_transport_websockets) {
             allowedDataTransport.push(
+                { value: "webtransport", name: "WebTransport" },
                 { value: "websocket", name: i.webSocket },
             )
         }

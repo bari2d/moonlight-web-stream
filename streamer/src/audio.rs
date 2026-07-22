@@ -24,8 +24,12 @@ impl AudioDecoder for StreamAudioDecoder {
         }
 
         stream.runtime.clone().block_on(async move {
-            let mut sender = stream.transport_sender.lock().await;
-            if let Some(sender) = sender.as_mut() {
+            let sender = {
+                let sender = stream.transport_sender.lock().await;
+                sender.clone()
+            };
+
+            if let Some(sender) = sender {
                 sender.setup_audio(audio_config, stream_config).await
             } else {
                 error!("Failed to setup audio because of missing transport!");
@@ -44,10 +48,13 @@ impl AudioDecoder for StreamAudioDecoder {
         };
 
         stream.runtime.clone().block_on(async move {
-            let mut stream = stream.transport_sender.lock().await;
+            let sender = {
+                let sender = stream.transport_sender.lock().await;
+                sender.clone()
+            };
 
-            if let Some(stream) = stream.as_mut() {
-                if let Err(err) = stream.send_audio_sample(sample.buffer).await {
+            if let Some(sender) = sender {
+                if let Err(err) = sender.send_audio_sample(sample.buffer).await {
                     warn!("Failed to send audio sample: {err}");
                 }
             } else {

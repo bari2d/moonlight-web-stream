@@ -123,6 +123,10 @@ class ViewerApp implements Component {
             this.refreshStreamRect()
         })
     }
+    private readonly scheduleViewportRefresh = () => {
+        this.scheduleStreamRectRefresh()
+        this.scheduleTouchUpdate()
+    }
 
     constructor(api: Api, hostId: number, appId: number, bootstrapRole: DetailedRole) {
         this.api = api
@@ -196,8 +200,8 @@ class ViewerApp implements Component {
 
         window.addEventListener("resize", this.scheduleStreamRectRefresh, listenerOptions)
         window.addEventListener("orientationchange", this.scheduleStreamRectRefresh, listenerOptions)
-        window.visualViewport?.addEventListener("resize", this.scheduleStreamRectRefresh, listenerOptions)
-        window.visualViewport?.addEventListener("scroll", this.scheduleStreamRectRefresh, listenerOptions)
+        window.visualViewport?.addEventListener("resize", this.scheduleViewportRefresh, listenerOptions)
+        window.visualViewport?.addEventListener("scroll", this.scheduleViewportRefresh, listenerOptions)
 
         document.addEventListener("pointerlockchange", this.onPointerLockChange.bind(this), listenerOptions)
         document.addEventListener("fullscreenchange", this.onFullscreenChange.bind(this), listenerOptions)
@@ -265,9 +269,9 @@ class ViewerApp implements Component {
             }
         })
 
-        // Start animation frame loop
-        this.onTouchUpdate()
-        this.onGamepadUpdate()
+        // Prime UI state once. Ongoing touch/gamepad polling is scheduled only
+        // while that kind of input is active.
+        this.scheduleTouchUpdate()
 
         this.stream.getInput().addScreenKeyboardVisibleEvent(this.onScreenKeyboardSetVisible.bind(this))
 
@@ -496,6 +500,7 @@ class ViewerApp implements Component {
         this.onUserInteraction()
         event.preventDefault()
         this.stream.getInput().onPointerDown(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
         event.stopPropagation()
     }
 
@@ -521,6 +526,7 @@ class ViewerApp implements Component {
         this.onUserInteraction()
         event.preventDefault()
         this.stream.getInput().onPointerUp(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
         this.finishPointerCapture(event.pointerId)
         event.stopPropagation()
     }
@@ -535,6 +541,7 @@ class ViewerApp implements Component {
             this.pendingAutoFullscreenMouseGesture = false
         } else {
             this.stream.getInput().onPointerCancel(event, this.getStreamRect())
+            this.scheduleTouchUpdate()
         }
 
         this.finishPointerCapture(event.pointerId)
@@ -554,6 +561,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream.getInput().onPointerMove(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
         event.stopPropagation()
     }
 
@@ -571,6 +579,7 @@ class ViewerApp implements Component {
         }
 
         this.stream.getInput().onPointerCancel(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
     }
 
     private capturePointer(event: PointerEvent) {
@@ -609,11 +618,13 @@ class ViewerApp implements Component {
                 // Ignore pointers that ended while cleanup was running.
             }
         }
+        this.scheduleTouchUpdate()
     }
 
     private releaseAllInputState() {
         this.stream.getInput().releaseAllInputs(this.getStreamRect())
         this.clearActivePointerCaptures()
+        this.scheduleTouchUpdate()
     }
 
     // Touch
@@ -628,6 +639,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream.getInput().onTouchStart(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
 
         event.stopPropagation()
     }
@@ -642,6 +654,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream.getInput().onTouchEnd(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
 
         event.stopPropagation()
     }
@@ -659,10 +672,18 @@ class ViewerApp implements Component {
 
         event?.preventDefault()
         this.stream.getInput().onTouchCancel(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
 
         event.stopPropagation()
     }
+    private scheduleTouchUpdate() {
+        if (!this.animationLoopsActive || this.touchUpdateFrame != null) {
+            return
+        }
+        this.touchUpdateFrame = window.requestAnimationFrame(this.touchUpdateFrameCallback)
+    }
     onTouchUpdate() {
+        this.touchUpdateFrame = null
         if (!this.animationLoopsActive) {
             return
         }
@@ -670,7 +691,9 @@ class ViewerApp implements Component {
         this.updateKeyboardViewportVideoOffset()
         this.renderLocalTouchCursor()
 
-        this.touchUpdateFrame = window.requestAnimationFrame(this.touchUpdateFrameCallback)
+        if (this.stream.getInput().hasActiveTouches()) {
+            this.scheduleTouchUpdate()
+        }
     }
     onTouchMove(event: TouchEvent) {
         if (this.pendingAutoFullscreenTouchGesture) {
@@ -681,6 +704,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream.getInput().onTouchMove(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
 
         event.stopPropagation()
     }
@@ -691,17 +715,28 @@ class ViewerApp implements Component {
     }
     onGamepadAdd(gamepad: Gamepad) {
         this.stream.getInput().onGamepadConnect(gamepad)
+        this.scheduleGamepadUpdate()
     }
     onGamepadDisconnect(event: GamepadEvent) {
         this.stream.getInput().onGamepadDisconnect(event)
+        this.scheduleGamepadUpdate()
+    }
+    private scheduleGamepadUpdate() {
+        if (!this.animationLoopsActive || this.gamepadUpdateFrame != null) {
+            return
+        }
+        this.gamepadUpdateFrame = window.requestAnimationFrame(this.gamepadUpdateFrameCallback)
     }
     onGamepadUpdate() {
+        this.gamepadUpdateFrame = null
         if (!this.animationLoopsActive) {
             return
         }
         this.stream.getInput().onGamepadUpdate()
 
-        this.gamepadUpdateFrame = window.requestAnimationFrame(this.gamepadUpdateFrameCallback)
+        if (navigator.getGamepads().some(gamepad => gamepad != null)) {
+            this.scheduleGamepadUpdate()
+        }
     }
 
     // Fullscreen
@@ -1048,8 +1083,8 @@ class ViewerApp implements Component {
         this.streamMutationObserver?.disconnect()
         window.removeEventListener("resize", this.scheduleStreamRectRefresh)
         window.removeEventListener("orientationchange", this.scheduleStreamRectRefresh)
-        window.visualViewport?.removeEventListener("resize", this.scheduleStreamRectRefresh)
-        window.visualViewport?.removeEventListener("scroll", this.scheduleStreamRectRefresh)
+        window.visualViewport?.removeEventListener("resize", this.scheduleViewportRefresh)
+        window.visualViewport?.removeEventListener("scroll", this.scheduleViewportRefresh)
         parent.removeChild(this.div)
     }
 

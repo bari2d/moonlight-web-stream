@@ -7,6 +7,9 @@ import { emptyVideoCodecs, maybeVideoCodecs, VideoCodecSupport } from "../video.
 import { CodecStreamTranslator, H264StreamVideoTranslator, H265StreamVideoTranslator, VIDEO_DECODER_CODECS_OUT_OF_BAND } from "./annex_b_translator.js";
 import { DataVideoRenderer, FrameVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index.js";
 
+const MAX_SETUP_BUFFERED_UNITS = 8
+const MAX_DECODE_QUEUE_DELAY_MS = 50
+
 export const VIDEO_DECODER_CODECS_IN_BAND: Record<keyof VideoCodecSupport, string> = {
     // avc1 = out of band config, avc3 = in band with sps, pps, idr
     "H264": "avc3.42E01E",
@@ -189,7 +192,18 @@ export class VideoDecoderPipe implements DataVideoRenderer {
             return
         }
         if (!this.decoderSetupFinished) {
-            this.bufferedUnits.push(unit)
+            // Setup can involve asynchronous capability probes. Keep only a
+            // small, decodable GOP instead of accumulating an unbounded stale
+            // prefix before the decoder is ready.
+            if (unit.type == "key") {
+                this.bufferedUnits.length = 0
+            }
+            if (
+                (this.bufferedUnits.length > 0 || unit.type == "key") &&
+                this.bufferedUnits.length < MAX_SETUP_BUFFERED_UNITS
+            ) {
+                this.bufferedUnits.push(unit)
+            }
             return
         }
 
@@ -200,7 +214,9 @@ export class VideoDecoderPipe implements DataVideoRenderer {
                 this.submitDecodeUnit(bufferedUnit)
             }
         }
-
+        if (unit.type != "key" && this.needsKeyFrame) {
+            return
+        }
 
         if (this.translator) {
             const value = this.translator.submitDecodeUnit(unit)
@@ -222,8 +238,10 @@ export class VideoDecoderPipe implements DataVideoRenderer {
 
                 this.decoder.reset()
                 this.decoder.configure(configure)
+            }
 
-                // This likely is an idr
+            if (unit.type == "key") {
+                this.needsKeyFrame = false
                 this.requestedIdr = false
             }
 
@@ -235,9 +253,6 @@ export class VideoDecoderPipe implements DataVideoRenderer {
             })
             this.decoder.decode(encodedChunk)
         } else {
-            if (unit.type != "key" && this.needsKeyFrame) {
-                return
-            }
             this.needsKeyFrame = false
             this.requestedIdr = false
 
@@ -253,33 +268,41 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     }
 
     private reset() {
-        if (!this.translator) {
-            this.decoder.reset()
-            this.needsKeyFrame = true
+        this.decoder.reset()
+        this.needsKeyFrame = true
 
-            if (this.config) {
-                this.decoder.configure(this.config)
-            } else {
-                this.logger?.debug("Failed to configure VideoDecoder because of missing config", { type: "fatal" })
-            }
-        } else if (this.config) {
+        if (this.translator && this.config) {
             this.translator.setBaseConfig(this.config)
+        }
+
+        const translatedConfig = this.translator?.getCurrentConfig() ?? null
+        const decoderConfig = this.translator
+            ? (translatedConfig?.description ? translatedConfig : null)
+            : this.config
+        if (decoderConfig) {
+            this.decoder.configure(decoderConfig)
+        } else if (!this.translator) {
+            this.logger?.debug("Failed to configure VideoDecoder because of missing config", { type: "fatal" })
         }
     }
 
     pollRequestIdr(): boolean {
         let requestIdr = false
 
-        const estimatedQueueDelayMs = this.decoder.decodeQueueSize * 1000 / this.fps
-        if (estimatedQueueDelayMs > 200 && this.decoder.decodeQueueSize > 2) {
-            // We have more than 200ms second backlog in the decoder
-            // -> This decoder is ass, request idr, flush that decoder
+        const estimatedQueueDelayMs = this.fps > 0
+            ? this.decoder.decodeQueueSize * 1000 / this.fps
+            : 0
+        const maxQueuedFrames = Math.max(2, Math.ceil(this.fps * MAX_DECODE_QUEUE_DELAY_MS / 1000))
+        if (this.decoder.decodeQueueSize >= maxQueuedFrames) {
+            // Once decode work is older than the live latency budget, showing
+            // it is worse than dropping to the next independently decodable
+            // frame. Reset once and gate deltas until that key frame arrives.
 
             if (!this.requestedIdr) {
                 requestIdr = true
                 this.reset()
             }
-            console.debug(`Requesting idr because of decode queue size(${this.decoder.decodeQueueSize}) and estimated delay of the queue: ${estimatedQueueDelayMs}`)
+            console.debug(`Requesting idr because decode queue size ${this.decoder.decodeQueueSize} represents about ${estimatedQueueDelayMs} ms`)
         }
 
         if ("pollRequestIdr" in this.base && typeof this.base.pollRequestIdr == "function") {
@@ -296,10 +319,11 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     }
 
     cleanup() {
+        this.bufferedUnits.length = 0
         this.decoder.close()
 
         if ("cleanup" in this.base && typeof this.base.cleanup == "function") {
-            return this.base.cleanup(arguments)
+            return this.base.cleanup(...arguments)
         }
     }
 

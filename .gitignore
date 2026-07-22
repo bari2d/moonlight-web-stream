@@ -1,18 +1,35 @@
-# Rust
-/target
-finalOutput
-ignore
+# Rust / Cargo
+/target/
+/target-review-generation/
 
-# VsCode
-.vscode
+# npm / TypeScript
+/node_modules/
+/dist/
+/web/api_bindings.ts
+*.tsbuildinfo
+npm-debug.log*
 
-# npm / js
-node_modules
-dist
-bindings
-web/api_bindings.ts
+# Release, runtime, and scratch output
+/finalOutput/
+/bindings/
+/ignore/
+/server/
 
-# Server
-server
+# Locally unpacked build toolchains
+/strawberry-perl-*/
 
-/.idea
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Editors / operating systems
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db

@@ -22,6 +22,7 @@ abstract class BaseCanvasFrameDrawPipe implements Pipe {
     protected base: CanvasRenderer
 
     private animationFrameRequest: number | null = null
+    private frameDirty = false
 
     private drawOnSubmit: boolean
 
@@ -38,35 +39,42 @@ abstract class BaseCanvasFrameDrawPipe implements Pipe {
     }
 
     async setup(setup: VideoRendererSetup): Promise<void> {
-        if (this.animationFrameRequest == null) {
-            this.animationFrameRequest = requestAnimationFrame(this.onAnimationFrame.bind(this))
-        }
-
         if ("setup" in this.base && typeof this.base.setup == "function") {
             return this.base.setup(...arguments)
         }
     }
 
     cleanup() {
+        if (this.animationFrameRequest != null) {
+            cancelAnimationFrame(this.animationFrameRequest)
+            this.animationFrameRequest = null
+        }
+        this.frameDirty = false
+
         if ("cleanup" in this.base && typeof this.base.cleanup == "function") {
             return this.base.cleanup(...arguments)
         }
     }
 
     protected onFrameSubmitted() {
+        this.frameDirty = true
         if (this.drawOnSubmit) {
             this.drawCurrentFrameIfReady()
+            this.frameDirty = false
+        } else if (this.animationFrameRequest == null) {
+            this.animationFrameRequest = requestAnimationFrame(this.onAnimationFrame)
         }
     }
 
     /** Draw currentFrame to canvas if context and frame are ready. Only updates size when dimensions change. */
     protected abstract drawCurrentFrameIfReady(): void
 
-    private onAnimationFrame() {
-        if (!this.drawOnSubmit) {
+    private onAnimationFrame = () => {
+        this.animationFrameRequest = null
+        if (this.frameDirty) {
             this.drawCurrentFrameIfReady()
+            this.frameDirty = false
         }
-        this.animationFrameRequest = requestAnimationFrame(this.onAnimationFrame.bind(this))
     }
 
     getBase(): Pipe | null {
@@ -117,6 +125,14 @@ export class CanvasFrameDrawPipe extends BaseCanvasFrameDrawPipe implements Fram
         context.drawImage(frame, 0, 0, w, h)
 
         this.base.commitFrame()
+        this.currentFrame = null
+        frame.close()
+    }
+
+    cleanup() {
+        this.currentFrame?.close()
+        this.currentFrame = null
+        return super.cleanup()
     }
 }
 
@@ -162,6 +178,12 @@ export class CanvasRgbaFrameDrawPipe extends BaseCanvasFrameDrawPipe implements 
         context.putImageData(frame, 0, 0)
 
         this.base.commitFrame()
+        this.currentFrame = null
+    }
+
+    cleanup() {
+        this.currentFrame = null
+        return super.cleanup()
     }
 }
 
@@ -481,6 +503,8 @@ void main() {
     }
 
     cleanup() {
+        this.currentFrame = null
+
         const { context: gl } = this.base.useCanvasContext("webgl")
         if (gl) {
             gl.deleteTexture(this.textureY)

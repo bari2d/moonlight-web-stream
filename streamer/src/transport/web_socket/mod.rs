@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -10,7 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::{
     api_bindings::{StreamClientMessage, StreamerStatsUpdate, TransportChannelId},
-    ipc::{ServerIpcMessage, StreamerIpcMessage},
+    ipc::{IpcSender, ServerIpcMessage, StreamerIpcMessage},
 };
 use log::{trace, warn};
 use moonlight_common::stream::{
@@ -21,32 +18,43 @@ use tokio::{
     spawn,
     sync::{
         Mutex,
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{Receiver, Sender, channel, error::TrySendError},
     },
-    time::sleep,
+    time::{MissedTickBehavior, interval},
 };
 
-use crate::{
-    buffer::ByteBuffer,
-    transport::{
-        InboundPacket, OutboundPacket, TransportChannel, TransportError, TransportEvent,
-        TransportEvents, TransportSender,
-    },
+use crate::transport::{
+    InboundPacket, OutboundPacket, TransportChannel, TransportError, TransportEvent,
+    TransportEvents, TransportSender,
 };
 
-pub async fn new() -> Result<(WebSocketTransportSender, WebSocketTransportEvents), anyhow::Error> {
-    let (event_sender, event_receiver) = channel::<TransportEvent>(20);
+const INBOUND_EVENT_QUEUE_CAPACITY: usize = 64;
+const VIDEO_HEADER_BYTES: usize = 6;
+const RTT_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const RTT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-    // TODO: use the video_frame_queue_size with packet rtt info to estimate latency of pictures and request idr if too big
+pub async fn new(
+    ipc_sender: IpcSender<StreamerIpcMessage>,
+) -> Result<(WebSocketTransportSender, WebSocketTransportEvents), anyhow::Error> {
+    // This queue is only for browser-to-host traffic. Outbound media bypasses it,
+    // so a slow browser connection cannot hold up mouse or keyboard input here.
+    let (event_sender, event_receiver) = channel::<TransportEvent>(INBOUND_EVENT_QUEUE_CAPACITY);
+
+    let rtt = Arc::new(Mutex::new(RttProbeState::new()));
 
     let sender = WebSocketTransportSender {
         event_sender,
-        rtt: Arc::new(Mutex::new((Instant::now(), 0))),
-        needs_idr: AtomicBool::new(false),
+        ipc_sender,
+        rtt,
+        recovery: VideoRecoveryState::default(),
     };
 
-    // This will start the loop of sending / receiving
-    recv_rtt(sender.rtt.clone(), sender.event_sender.clone(), 0).await;
+    // Probe independently of replies. A dropped reply is retried after the
+    // bounded timeout rather than permanently stopping RTT measurements.
+    spawn(run_rtt_probe_loop(
+        Arc::downgrade(&sender.rtt),
+        sender.ipc_sender.clone(),
+    ));
 
     Ok((sender, WebSocketTransportEvents { event_receiver }))
 }
@@ -68,18 +76,18 @@ impl TransportEvents for WebSocketTransportEvents {
 
 pub struct WebSocketTransportSender {
     event_sender: Sender<TransportEvent>,
-    /// Time when it was sent, sequence_number
-    rtt: Arc<Mutex<(Instant, u16)>>,
-    needs_idr: AtomicBool,
+    ipc_sender: IpcSender<StreamerIpcMessage>,
+    rtt: Arc<Mutex<RttProbeState>>,
+    recovery: VideoRecoveryState,
 }
 
 async fn send_packet(
-    event_sender: &Sender<TransportEvent>,
+    ipc_sender: &IpcSender<StreamerIpcMessage>,
     packet: OutboundPacket,
 ) -> Result<(), TransportError> {
-    let mut new_buffer = Vec::new();
+    let mut serialized = Vec::new();
 
-    let (id, mut range) = match packet.serialize(&mut new_buffer) {
+    let (id, range) = match packet.serialize(&mut serialized) {
         Some(packet) => packet,
         None => {
             warn!("Failed to serialize packet: {packet:?}");
@@ -87,49 +95,114 @@ async fn send_packet(
         }
     };
 
-    if range.start == 0 {
-        new_buffer.resize(range.end - range.start + 1, 0);
-        new_buffer.copy_within(range.clone(), range.start + 1);
-        range.start += 1;
-    }
-    new_buffer[range.start - 1] = id.0;
+    // Allocate the final wire message at its exact size instead of growing and
+    // shifting the serialization buffer in place.
+    let mut framed = Vec::with_capacity(range.len() + 1);
+    framed.push(id.0);
+    framed.extend_from_slice(&serialized[range]);
 
-    if event_sender
-        .send(TransportEvent::SendIpc(
-            StreamerIpcMessage::WebSocketTransport(Bytes::from(new_buffer)),
-        ))
+    ipc_sender
+        .send_checked(StreamerIpcMessage::WebSocketTransport(Bytes::from(framed)))
         .await
-        .is_err()
-    {
-        return Err(TransportError::Closed);
-    }
+        .map_err(|_| TransportError::Closed)?;
 
     Ok(())
 }
 
-async fn recv_rtt(
-    rtt_mutex: Arc<Mutex<(Instant, u16)>>,
-    event_sender: Sender<TransportEvent>,
-    recv_sequence_number: u16,
-) {
-    let (send, mut sequence_number) = {
-        let rtt = rtt_mutex.lock().await;
-        *rtt
-    };
+struct RttProbeState {
+    sent_at: Option<Instant>,
+    sequence_number: u16,
+    awaiting_reply: bool,
+}
 
-    let now = Instant::now();
-    if recv_sequence_number != sequence_number {
-        warn!(
-            "Expected rtt packet with sequence_number {sequence_number} but got {recv_sequence_number}"
-        );
+impl RttProbeState {
+    fn new() -> Self {
+        Self {
+            sent_at: None,
+            sequence_number: 0,
+            awaiting_reply: false,
+        }
     }
 
-    // Calc rtt
-    let rtt = now - send;
+    fn start_probe_if_due(&mut self, now: Instant) -> Option<u16> {
+        if self.awaiting_reply
+            && self
+                .sent_at
+                .is_some_and(|sent_at| now.duration_since(sent_at) < RTT_PROBE_TIMEOUT)
+        {
+            return None;
+        }
 
-    // Send rtt via stats
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+        self.sent_at = Some(now);
+        self.awaiting_reply = true;
+        Some(self.sequence_number)
+    }
+
+    fn accept_reply(&mut self, sequence_number: u16, now: Instant) -> Option<Duration> {
+        if !self.awaiting_reply || sequence_number != self.sequence_number {
+            return None;
+        }
+
+        self.awaiting_reply = false;
+        self.sent_at.take().map(|sent_at| now - sent_at)
+    }
+}
+
+async fn run_rtt_probe_loop(
+    rtt_mutex: Weak<Mutex<RttProbeState>>,
+    ipc_sender: IpcSender<StreamerIpcMessage>,
+) {
+    let mut ticker = interval(RTT_PROBE_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let Some(rtt_mutex) = rtt_mutex.upgrade() else {
+            return;
+        };
+        if ipc_sender.is_closed() {
+            return;
+        }
+
+        let sequence_number = rtt_mutex.lock().await.start_probe_if_due(Instant::now());
+        drop(rtt_mutex);
+
+        let Some(sequence_number) = sequence_number else {
+            continue;
+        };
+        if let Err(err) = send_packet(&ipc_sender, OutboundPacket::Rtt { sequence_number }).await {
+            warn!(
+                "Failed to send web socket rtt packet with sequence number {sequence_number}: {err}"
+            );
+            return;
+        }
+    }
+}
+
+async fn recv_rtt(
+    rtt_mutex: Arc<Mutex<RttProbeState>>,
+    ipc_sender: IpcSender<StreamerIpcMessage>,
+    recv_sequence_number: u16,
+) {
+    let (expected_sequence_number, rtt) = {
+        let mut state = rtt_mutex.lock().await;
+        let expected = state.sequence_number;
+        (
+            expected,
+            state.accept_reply(recv_sequence_number, Instant::now()),
+        )
+    };
+
+    let Some(rtt) = rtt else {
+        warn!(
+            "Expected rtt packet with sequence_number {expected_sequence_number} but got {recv_sequence_number}"
+        );
+        return;
+    };
+
     if let Err(err) = send_packet(
-        &event_sender,
+        &ipc_sender,
         OutboundPacket::Stats(StreamerStatsUpdate::BrowserRtt {
             rtt_ms: rtt.as_secs_f64() * 1000.0,
         }),
@@ -138,20 +211,117 @@ async fn recv_rtt(
     {
         warn!("Failed to send rtt stats update for web socket: {err}");
     }
+}
 
-    // Wait a few ms
-    sleep(Duration::from_millis(200)).await;
+#[derive(Default)]
+struct VideoRecoveryState {
+    inner: StdMutex<VideoRecoveryInner>,
+}
 
-    sequence_number += 1;
-    {
-        let mut rtt = rtt_mutex.lock().await;
-        *rtt = (Instant::now(), sequence_number);
+#[derive(Default)]
+struct VideoRecoveryInner {
+    recovering: bool,
+    /// True after returning NeedIdr for congestion. While latched, discarded
+    /// P-frames return Ok so the decoder is not flooded with duplicate IDRs.
+    recovery_request_outstanding: bool,
+    /// Kept separate so an explicit browser request is never swallowed by an
+    /// already-outstanding congestion recovery request.
+    browser_requested_idr: bool,
+}
+
+impl VideoRecoveryState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VideoRecoveryInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    // Send new rtt packet
-    if let Err(err) = send_packet(&event_sender, OutboundPacket::Rtt { sequence_number }).await {
-        warn!("Failed to send web socket rtt packet with sequence number {sequence_number}: {err}");
+    /// Returns a result only when this frame should be discarded before an IPC
+    /// enqueue is attempted.
+    fn before_enqueue(&self, frame_type: FrameType) -> Option<DecodeResult> {
+        let mut state = self.lock();
+        if !state.recovering || frame_type != FrameType::PFrame {
+            return None;
+        }
+
+        if state.browser_requested_idr {
+            state.browser_requested_idr = false;
+            state.recovery_request_outstanding = true;
+            return Some(DecodeResult::NeedIdr);
+        }
+        if !state.recovery_request_outstanding {
+            state.recovery_request_outstanding = true;
+            return Some(DecodeResult::NeedIdr);
+        }
+        Some(DecodeResult::Ok)
     }
+
+    fn request_idr(&self) {
+        self.lock().browser_requested_idr = true;
+    }
+
+    fn on_enqueue_failed(&self, frame_type: FrameType) -> DecodeResult {
+        let mut state = self.lock();
+        state.recovering = true;
+
+        // Receipt of an IDR means the previous request was serviced. If that
+        // IDR itself cannot enter IPC, immediately request exactly one new IDR.
+        if frame_type == FrameType::Idr {
+            state.recovery_request_outstanding = true;
+            state.browser_requested_idr = false;
+            return DecodeResult::NeedIdr;
+        }
+
+        if state.browser_requested_idr {
+            state.browser_requested_idr = false;
+            state.recovery_request_outstanding = true;
+            return DecodeResult::NeedIdr;
+        }
+        if !state.recovery_request_outstanding {
+            state.recovery_request_outstanding = true;
+            DecodeResult::NeedIdr
+        } else {
+            DecodeResult::Ok
+        }
+    }
+
+    fn on_enqueued(&self, frame_type: FrameType) -> DecodeResult {
+        let mut state = self.lock();
+        if frame_type == FrameType::Idr {
+            state.recovering = false;
+            state.recovery_request_outstanding = false;
+            // An accepted IDR also satisfies an explicit browser request that
+            // raced with, or directly triggered, this frame.
+            state.browser_requested_idr = false;
+            return DecodeResult::Ok;
+        }
+
+        if state.browser_requested_idr {
+            state.browser_requested_idr = false;
+            DecodeResult::NeedIdr
+        } else {
+            DecodeResult::Ok
+        }
+    }
+}
+
+fn encode_video_frame<'a>(
+    frame_type: FrameType,
+    timestamp_us: u32,
+    buffers: impl IntoIterator<Item = &'a [u8]>,
+    payload_len: usize,
+) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(VIDEO_HEADER_BYTES + payload_len);
+    framed.push(TransportChannelId::HOST_VIDEO);
+    framed.push(match frame_type {
+        FrameType::Idr => 1,
+        FrameType::PFrame => 0,
+    });
+    framed.extend_from_slice(&timestamp_us.to_be_bytes());
+    for buffer in buffers {
+        framed.extend_from_slice(buffer);
+    }
+    framed
 }
 
 #[async_trait]
@@ -164,41 +334,30 @@ impl TransportSender for WebSocketTransportSender {
         &'a self,
         unit: VideoDecodeUnit<&'a [u8]>,
     ) -> Result<DecodeResult, TransportError> {
-        let mut new_buffer = vec![0; 5];
-
-        let mut byte_buffer = ByteBuffer::new(new_buffer.as_mut_slice());
-        byte_buffer.put_u8(TransportChannelId::HOST_VIDEO);
-        byte_buffer.put_u8(match unit.frame_type {
-            FrameType::Idr => 1,
-            FrameType::PFrame => 0,
-        });
-        byte_buffer.put_u8(0);
-        byte_buffer.put_u32(unit.timestamp.as_micros() as u32);
-
-        for buffer in &unit.buffers {
-            new_buffer.extend_from_slice(buffer.data);
+        if let Some(result) = self.recovery.before_enqueue(unit.frame_type) {
+            return Ok(result);
         }
-        // TODO: ignore h264/h265 fillerdata?
-        if self
-            .event_sender
-            .send(TransportEvent::SendIpc(
-                StreamerIpcMessage::WebSocketTransport(Bytes::from(new_buffer)),
-            ))
-            .await
-            .is_err()
+
+        // Wire format: channel id (1), frame type (1), timestamp in us (4),
+        // followed by the Annex-B access unit. Keep this header in sync with
+        // DepacketizeVideoPipe in the browser.
+        let payload_len = unit.buffers.iter().map(|buffer| buffer.data.len()).sum();
+        let frame_type = unit.frame_type;
+        let framed = encode_video_frame(
+            frame_type,
+            unit.timestamp.as_micros() as u32,
+            unit.buffers.iter().map(|buffer| buffer.data),
+            payload_len,
+        );
+
+        match self
+            .ipc_sender
+            .try_send_low_priority(StreamerIpcMessage::WebSocketTransport(Bytes::from(framed)))
         {
-            return Err(TransportError::Closed);
+            Ok(()) => Ok(self.recovery.on_enqueued(frame_type)),
+            Err(TrySendError::Full(_)) => Ok(self.recovery.on_enqueue_failed(frame_type)),
+            Err(TrySendError::Closed(_)) => Err(TransportError::Closed),
         }
-
-        if self
-            .needs_idr
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Ok(DecodeResult::NeedIdr);
-        }
-
-        Ok(DecodeResult::Ok)
     }
 
     async fn setup_audio(
@@ -210,29 +369,21 @@ impl TransportSender for WebSocketTransportSender {
         0
     }
     async fn send_audio_sample(&self, data: &[u8]) -> Result<(), TransportError> {
-        let mut new_buffer = vec![0];
+        let mut framed = Vec::with_capacity(data.len() + 1);
+        framed.push(TransportChannelId::HOST_AUDIO);
+        framed.extend_from_slice(data);
 
-        let mut byte_buffer = ByteBuffer::new(new_buffer.as_mut_slice());
-        byte_buffer.put_u8(TransportChannelId::HOST_AUDIO);
-
-        new_buffer.extend_from_slice(data);
-
-        if self
-            .event_sender
-            .send(TransportEvent::SendIpc(
-                StreamerIpcMessage::WebSocketTransport(Bytes::from(new_buffer)),
-            ))
-            .await
-            .is_err()
+        match self
+            .ipc_sender
+            .try_send_realtime(StreamerIpcMessage::WebSocketTransport(Bytes::from(framed)))
         {
-            return Err(TransportError::Closed);
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(TransportError::Closed),
         }
-
-        Ok(())
     }
 
     async fn send(&self, packet: OutboundPacket) -> Result<(), TransportError> {
-        send_packet(&self.event_sender, packet).await
+        send_packet(&self.ipc_sender, packet).await
     }
 
     async fn on_ipc_message(&self, message: ServerIpcMessage) -> Result<(), TransportError> {
@@ -253,13 +404,13 @@ impl TransportSender for WebSocketTransportSender {
                 };
 
                 if let InboundPacket::RequestVideoIdr = packet {
-                    self.needs_idr.store(true, Ordering::Release);
+                    self.recovery.request_idr();
                 }
 
                 if let InboundPacket::Rtt { sequence_number } = packet {
                     spawn(recv_rtt(
                         self.rtt.clone(),
-                        self.event_sender.clone(),
+                        self.ipc_sender.clone(),
                         sequence_number,
                     ));
                 }
@@ -297,5 +448,183 @@ impl TransportSender for WebSocketTransportSender {
     async fn close(&self) -> Result<(), TransportError> {
         // emtpy
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_frame_wire_format_is_byte_exact() {
+        let first = [0x00, 0x00, 0x00, 0x01, 0x67];
+        let second = [0x00, 0x00, 0x01, 0x65, 0xaa];
+        let encoded = encode_video_frame(
+            FrameType::Idr,
+            0x0102_0304,
+            [&first[..], &second[..]],
+            first.len() + second.len(),
+        );
+
+        assert_eq!(
+            encoded,
+            [
+                TransportChannelId::HOST_VIDEO,
+                1,
+                0x01,
+                0x02,
+                0x03,
+                0x04,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                0x67,
+                0x00,
+                0x00,
+                0x01,
+                0x65,
+                0xaa,
+            ]
+        );
+        assert_eq!(encoded.len(), encoded.capacity());
+    }
+
+    #[test]
+    fn overload_requests_one_idr_then_latches_until_it_arrives() {
+        let state = VideoRecoveryState::default();
+
+        assert!(matches!(
+            state.on_enqueue_failed(FrameType::PFrame),
+            DecodeResult::NeedIdr
+        ));
+        for _ in 0..100 {
+            assert!(matches!(
+                state.before_enqueue(FrameType::PFrame),
+                Some(DecodeResult::Ok)
+            ));
+        }
+        assert!(state.before_enqueue(FrameType::Idr).is_none());
+
+        assert!(matches!(
+            state.on_enqueued(FrameType::Idr),
+            DecodeResult::Ok
+        ));
+        assert!(state.before_enqueue(FrameType::PFrame).is_none());
+    }
+
+    #[test]
+    fn failed_idr_enqueue_reissues_recovery_once() {
+        let state = VideoRecoveryState::default();
+
+        assert!(matches!(
+            state.on_enqueue_failed(FrameType::PFrame),
+            DecodeResult::NeedIdr
+        ));
+        assert!(state.before_enqueue(FrameType::Idr).is_none());
+        assert!(matches!(
+            state.on_enqueue_failed(FrameType::Idr),
+            DecodeResult::NeedIdr
+        ));
+        assert!(matches!(
+            state.before_enqueue(FrameType::PFrame),
+            Some(DecodeResult::Ok)
+        ));
+
+        assert!(state.before_enqueue(FrameType::Idr).is_none());
+        assert!(matches!(
+            state.on_enqueued(FrameType::Idr),
+            DecodeResult::Ok
+        ));
+        assert!(state.before_enqueue(FrameType::PFrame).is_none());
+    }
+
+    #[test]
+    fn explicit_browser_idr_request_is_preserved() {
+        let state = VideoRecoveryState::default();
+        state.request_idr();
+
+        assert!(matches!(
+            state.on_enqueued(FrameType::PFrame),
+            DecodeResult::NeedIdr
+        ));
+        assert!(matches!(
+            state.on_enqueued(FrameType::PFrame),
+            DecodeResult::Ok
+        ));
+    }
+
+    #[test]
+    fn an_accepted_idr_satisfies_an_explicit_browser_request() {
+        let state = VideoRecoveryState::default();
+        state.request_idr();
+
+        assert!(matches!(
+            state.on_enqueued(FrameType::Idr),
+            DecodeResult::Ok
+        ));
+        assert!(matches!(
+            state.on_enqueued(FrameType::PFrame),
+            DecodeResult::Ok
+        ));
+    }
+
+    #[test]
+    fn explicit_browser_idr_is_not_swallowed_by_recovery_latch() {
+        let state = VideoRecoveryState::default();
+        assert!(matches!(
+            state.on_enqueue_failed(FrameType::PFrame),
+            DecodeResult::NeedIdr
+        ));
+
+        state.request_idr();
+        assert!(matches!(
+            state.before_enqueue(FrameType::PFrame),
+            Some(DecodeResult::NeedIdr)
+        ));
+        assert!(matches!(
+            state.before_enqueue(FrameType::PFrame),
+            Some(DecodeResult::Ok)
+        ));
+    }
+
+    #[test]
+    fn rtt_probe_retries_only_after_timeout_and_ignores_old_replies() {
+        let mut state = RttProbeState::new();
+        let start = Instant::now();
+        let first = state
+            .start_probe_if_due(start)
+            .expect("first probe should start immediately");
+
+        assert!(
+            state
+                .start_probe_if_due(start + RTT_PROBE_TIMEOUT - Duration::from_millis(1))
+                .is_none(),
+            "only one probe may be outstanding before its timeout"
+        );
+
+        let second = state
+            .start_probe_if_due(start + RTT_PROBE_TIMEOUT)
+            .expect("lost reply should be retried at the timeout");
+        assert_ne!(second, first);
+        assert!(
+            state
+                .accept_reply(first, start + RTT_PROBE_TIMEOUT + Duration::from_millis(1))
+                .is_none(),
+            "a late reply for the timed-out probe must not complete the new one"
+        );
+        assert_eq!(
+            state.accept_reply(
+                second,
+                start + RTT_PROBE_TIMEOUT + Duration::from_millis(25)
+            ),
+            Some(Duration::from_millis(25))
+        );
+        assert!(
+            state
+                .start_probe_if_due(start + RTT_PROBE_TIMEOUT + Duration::from_millis(26))
+                .is_some(),
+            "a valid reply allows the next interval to start one new probe"
+        );
     }
 }

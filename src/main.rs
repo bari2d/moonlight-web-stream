@@ -42,6 +42,7 @@ mod web;
 
 mod cli;
 mod human_json;
+mod web_transport;
 
 #[actix_web::main]
 async fn main() {
@@ -240,6 +241,9 @@ impl RootSpanBuilder for ActixDebugSpan {
 }
 
 async fn start(config: Config) -> Result<(), anyhow::Error> {
+    // WebTransport owns UDP/443 while Actix (or the front proxy) continues to
+    // serve HTTPS and the authenticated control WebSocket over TCP/443.
+    let web_transport = Data::new(web_transport::start(config.web_transport.clone()).await?);
     let app = App::new(config.clone()).await?;
     let app = Data::new(app);
 
@@ -247,6 +251,7 @@ async fn start(config: Config) -> Result<(), anyhow::Error> {
     let server = HttpServer::new({
         let url_path_prefix = config.web_server.url_path_prefix.clone();
         let app = app.clone();
+        let web_transport = web_transport.clone();
 
         move || {
             ActixApp::new()
@@ -254,6 +259,7 @@ async fn start(config: Config) -> Result<(), anyhow::Error> {
                 .service(
                     scope(&url_path_prefix)
                         .app_data(app.clone())
+                        .app_data(web_transport.clone())
                         .wrap(
                             middleware::DefaultHeaders::new()
                                 .add((
@@ -268,9 +274,12 @@ async fn start(config: Config) -> Result<(), anyhow::Error> {
                         .service(web_service()),
                 )
         }
-    });
+    })
+    // Interactive stream input consists of many tiny writes. Disable Nagle's
+    // algorithm so they are not held waiting for a delayed ACK.
+    .tcp_nodelay(true);
 
-    if let Some(certificate) = app.config().web_server.certificate.as_ref() {
+    let server_result = if let Some(certificate) = app.config().web_server.certificate.as_ref() {
         info!("[Server]: Running Https Server with ssl tls");
 
         let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
@@ -282,10 +291,15 @@ async fn start(config: Config) -> Result<(), anyhow::Error> {
             .set_certificate_chain_file(&certificate.certificate_pem)
             .expect("failed to set certificate");
 
-        server.bind_openssl(bind_address, builder)?.run().await?;
+        server.bind_openssl(bind_address, builder)?.run().await
     } else {
-        server.bind(bind_address)?.run().await?;
+        server.bind(bind_address)?.run().await
+    };
+
+    if let Some(hub) = web_transport.get_ref().as_ref() {
+        hub.shutdown();
     }
+    server_result?;
 
     Ok(())
 }

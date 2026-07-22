@@ -1,4 +1,10 @@
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytes::Bytes;
 use log::LevelFilter;
@@ -6,11 +12,18 @@ use pem::Pem;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{
-        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines, Stdin, Stdout,
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin,
+        Stdout,
     },
     process::{ChildStderr, ChildStdin, ChildStdout},
     spawn,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Notify,
+        mpsc::{
+            Receiver, Sender, channel,
+            error::{SendError, TrySendError},
+        },
+    },
 };
 use tracing::{Span, info, trace, warn};
 
@@ -18,6 +31,19 @@ use crate::{
     api_bindings::{StreamClientMessage, StreamPermissions, StreamServerMessage},
     config::WebRtcConfig,
 };
+
+/// Upper bound for one encoded IPC message. This is deliberately large enough
+/// for high-resolution encoded video frames while preventing a corrupt length
+/// prefix from causing an unbounded allocation.
+const MAX_IPC_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const IPC_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
+/// Reliable control and lifecycle messages. This queue is deliberately
+/// independent from realtime media so video congestion cannot delay Stop,
+/// setup, input, or RTT messages.
+const IPC_RELIABLE_QUEUE_CAPACITY: usize = 16;
+/// Short realtime queue used by audio. It is drained before low-priority video,
+/// but remains bounded so stale audio cannot accumulate latency.
+const IPC_REALTIME_QUEUE_CAPACITY: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamerConfig {
@@ -53,6 +79,69 @@ pub enum StreamerIpcMessage {
     Stop,
 }
 
+#[derive(Debug)]
+struct LowPrioritySlot<Message> {
+    message: StdMutex<Option<Message>>,
+    notify: Notify,
+    writer_closed: AtomicBool,
+}
+
+impl<Message> LowPrioritySlot<Message> {
+    fn new() -> Self {
+        Self {
+            message: StdMutex::new(None),
+            notify: Notify::new(),
+            writer_closed: AtomicBool::new(false),
+        }
+    }
+
+    fn take(&self) -> Option<Message> {
+        self.message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn close(&self) {
+        // Serialize closure with low-priority insertion. Once close returns, a
+        // concurrent sender cannot pass its second closed check and publish an
+        // undrainable message after the IPC writer has exited.
+        let mut message = self
+            .message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.writer_closed.store(true, Ordering::Release);
+        message.take();
+        self.notify.notify_waiters();
+    }
+}
+
+struct IpcQueues<Message> {
+    reliable: Receiver<Message>,
+    realtime: Receiver<Message>,
+    low_priority: Arc<LowPrioritySlot<Message>>,
+}
+
+fn priority_channel<Message>(span: Span) -> (IpcSender<Message>, IpcQueues<Message>) {
+    let (reliable_sender, reliable) = channel(IPC_RELIABLE_QUEUE_CAPACITY);
+    let (realtime_sender, realtime) = channel(IPC_REALTIME_QUEUE_CAPACITY);
+    let low_priority = Arc::new(LowPrioritySlot::new());
+
+    (
+        IpcSender {
+            reliable_sender,
+            realtime_sender,
+            low_priority: low_priority.clone(),
+            span,
+        },
+        IpcQueues {
+            reliable,
+            realtime,
+            low_priority,
+        },
+    )
+}
+
 // We're using the:
 // Stdin: message passing
 // Stdout: message passing
@@ -82,24 +171,22 @@ where
         });
     }
 
-    let (sender, receiver) = channel::<Message>(10);
+    let (sender, queues) = priority_channel::<Message>(span.clone());
 
     spawn({
         let span = span.clone();
 
         async move {
-            ipc_sender(span.clone(), stdin, receiver).await;
+            ipc_sender(span.clone(), stdin, queues).await;
         }
     });
 
     (
-        IpcSender {
-            sender,
-            span: span.clone(),
-        },
+        sender,
         IpcReceiver {
             errored: false,
-            read: create_lines(stdout),
+            read: create_reader(stdout),
+            encoded: Vec::new(),
             phantom: Default::default(),
             span,
         },
@@ -115,77 +202,141 @@ where
     ParentMessage: DeserializeOwned,
     Message: Send + Serialize + 'static,
 {
-    let (sender, receiver) = channel::<Message>(10);
+    let (sender, queues) = priority_channel::<Message>(span.clone());
 
     spawn({
         let span = span.clone();
 
         async move {
-            ipc_sender(span.clone(), stdout, receiver).await;
+            ipc_sender(span.clone(), stdout, queues).await;
         }
     });
 
     (
-        IpcSender {
-            sender,
-            span: span.clone(),
-        },
+        sender,
         IpcReceiver {
             errored: false,
-            read: create_lines(stdin),
+            read: create_reader(stdin),
+            encoded: Vec::new(),
             phantom: Default::default(),
             span,
         },
     )
 }
-fn create_lines(
+fn create_reader(
     read: impl AsyncRead + Send + Unpin + 'static,
-) -> Lines<Box<dyn AsyncBufRead + Send + Unpin + 'static>> {
-    (Box::new(BufReader::new(read)) as Box<dyn AsyncBufRead + Send + Unpin + 'static>).lines()
+) -> Box<dyn AsyncRead + Send + Unpin + 'static> {
+    Box::new(BufReader::new(read))
 }
 
 async fn ipc_sender<Message>(
     span: Span,
-    mut write: impl AsyncWriteExt + Unpin,
-    mut receiver: Receiver<Message>,
+    mut write: impl AsyncWrite + Unpin,
+    mut queues: IpcQueues<Message>,
 ) where
     Message: Serialize,
 {
-    while let Some(value) = receiver.recv().await {
-        let mut json = match serde_json::to_string(&value) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(parent: &span,"[Ipc]: failed to encode message: {err:?}");
-                continue;
-            }
-        };
+    // Reuse one framed buffer. Encoded video can be several MiB, so allocating
+    // a new body and issuing a separate prefix write for every frame creates
+    // avoidable allocator and pipe overhead on the hottest IPC path.
+    let mut frame = Vec::new();
+    while let Some(value) = next_ipc_message(&mut queues).await {
+        frame.clear();
+        frame.resize(IPC_LENGTH_PREFIX_BYTES, 0);
+        if let Err(err) =
+            bincode::serde::encode_into_std_write(&value, &mut frame, bincode::config::standard())
+        {
+            warn!(parent: &span, "[Ipc]: failed to encode message: {err}");
+            continue;
+        }
 
-        trace!(parent: &span, "[Ipc] sending {json}");
+        let encoded_len = frame.len() - IPC_LENGTH_PREFIX_BYTES;
+        if encoded_len > MAX_IPC_FRAME_BYTES {
+            warn!(
+                parent: &span,
+                "[Ipc]: refusing to send oversized message ({} bytes; maximum is {} bytes)",
+                encoded_len,
+                MAX_IPC_FRAME_BYTES
+            );
+            continue;
+        }
 
-        json.push('\n');
+        let encoded_len = encoded_len as u32;
+        frame[..IPC_LENGTH_PREFIX_BYTES].copy_from_slice(&encoded_len.to_be_bytes());
+        trace!(parent: &span, "[Ipc] sending binary frame ({encoded_len} bytes)");
 
-        if let Err(err) = write.write_all(json.as_bytes()).await {
-            warn!(parent: &span, "failed to write message length: {err:?}");
-            return;
-        };
+        if let Err(err) = write.write_all(&frame).await {
+            warn!(parent: &span, "[Ipc]: failed to write framed message: {err}");
+            break;
+        }
 
         if let Err(err) = write.flush().await {
-            warn!(parent: &span, "failed to flush: {err:?}");
-            return;
+            warn!(parent: &span, "[Ipc]: failed to flush message: {err}");
+            break;
+        }
+    }
+
+    // Close both bounded queues and the low-priority slot together so every
+    // sending API observes the same terminal state after an IPC write failure.
+    queues.reliable.close();
+    queues.realtime.close();
+    queues.low_priority.close();
+}
+
+async fn next_ipc_message<Message>(queues: &mut IpcQueues<Message>) -> Option<Message> {
+    loop {
+        // Explicit polling plus a biased select makes ordering deterministic:
+        // reliable control first, short-lived audio second, queued video last.
+        if let Ok(message) = queues.reliable.try_recv() {
+            return Some(message);
+        }
+        if let Ok(message) = queues.realtime.try_recv() {
+            return Some(message);
+        }
+        if let Some(message) = queues.low_priority.take() {
+            return Some(message);
+        }
+
+        let reliable_closed = queues.reliable.is_closed();
+        let realtime_closed = queues.realtime.is_closed();
+        if reliable_closed && realtime_closed {
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            message = queues.reliable.recv(), if !reliable_closed => {
+                if let Some(message) = message {
+                    return Some(message);
+                }
+            }
+            message = queues.realtime.recv(), if !realtime_closed => {
+                if let Some(message) = message {
+                    return Some(message);
+                }
+            }
+            _ = queues.low_priority.notify.notified() => {
+                // Loop back through the priority checks. A reliable message may
+                // have arrived at the same time as this notification.
+            }
         }
     }
 }
 
 #[derive(Debug)]
 pub struct IpcSender<Message> {
-    sender: Sender<Message>,
+    reliable_sender: Sender<Message>,
+    realtime_sender: Sender<Message>,
+    low_priority: Arc<LowPrioritySlot<Message>>,
     span: Span,
 }
 
 impl<Message> Clone for IpcSender<Message> {
     fn clone(&self) -> Self {
         Self {
-            sender: self.sender.clone(),
+            reliable_sender: self.reliable_sender.clone(),
+            realtime_sender: self.realtime_sender.clone(),
+            low_priority: self.low_priority.clone(),
             span: self.span.clone(),
         }
     }
@@ -195,21 +346,72 @@ impl<Message> IpcSender<Message>
 where
     Message: Serialize + Send + 'static,
 {
-    pub async fn send(&mut self, message: Message) {
-        if self.sender.send(message).await.is_err() {
+    /// Enqueue a reliable high-priority message. Backpressure is applied rather
+    /// than dropping control or lifecycle state.
+    pub async fn send(&self, message: Message) {
+        if self.send_checked(message).await.is_err() {
             warn!(parent: &self.span, "failed to send message");
         }
     }
-    pub fn blocking_send(&mut self, message: Message) {
-        if self.sender.blocking_send(message).is_err() {
+
+    /// Enqueue a reliable message while preserving closure information for
+    /// latency-sensitive callers that need to terminate their own loops.
+    pub async fn send_checked(&self, message: Message) -> Result<(), SendError<Message>> {
+        self.reliable_sender.send(message).await
+    }
+
+    pub fn blocking_send(&self, message: Message) {
+        if self.reliable_sender.blocking_send(message).is_err() {
             warn!(parent: &self.span, "failed to send message");
         }
+    }
+
+    /// Attempt to enqueue a reliable high-priority message without waiting.
+    pub fn try_send(&self, message: Message) -> Result<(), TrySendError<Message>> {
+        self.reliable_sender.try_send(message)
+    }
+
+    /// Attempt to enqueue short-lived realtime data such as audio. This queue
+    /// is separate from video and drains ahead of it, but remains bounded.
+    pub fn try_send_realtime(&self, message: Message) -> Result<(), TrySendError<Message>> {
+        self.realtime_sender.try_send(message)
+    }
+
+    /// Attempt to enqueue disposable bulk data such as an encoded video frame.
+    /// There is exactly one low-priority slot, so video can never crowd reliable
+    /// or realtime queues. Returning Full lets the video sender enter GOP-safe
+    /// IDR recovery instead of silently replacing a dependent frame.
+    pub fn try_send_low_priority(&self, message: Message) -> Result<(), TrySendError<Message>> {
+        if self.low_priority.writer_closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed(message));
+        }
+
+        let mut slot = self
+            .low_priority
+            .message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.low_priority.writer_closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed(message));
+        }
+        if slot.is_some() {
+            return Err(TrySendError::Full(message));
+        }
+        *slot = Some(message);
+        drop(slot);
+        self.low_priority.notify.notify_one();
+        Ok(())
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.reliable_sender.is_closed() || self.low_priority.writer_closed.load(Ordering::Acquire)
     }
 }
 
 pub struct IpcReceiver<Message> {
     errored: bool,
-    read: Lines<Box<dyn AsyncBufRead + Send + Unpin>>,
+    read: Box<dyn AsyncRead + Send + Unpin>,
+    encoded: Vec<u8>,
     phantom: PhantomData<Message>,
     span: Span,
 }
@@ -223,27 +425,282 @@ where
             return None;
         }
 
-        let line = match self.read.next_line().await {
-            Ok(Some(value)) => value,
-            Ok(None) => return None,
+        let mut prefix = [0_u8; IPC_LENGTH_PREFIX_BYTES];
+        match self.read.read_exact(&mut prefix[..1]).await {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(err) => {
                 self.errored = true;
-
-                warn!(parent: &self.span, "failed to read next line {err:?}");
-
+                warn!(parent: &self.span, "[Ipc]: failed to read message length: {err}");
                 return None;
             }
-        };
+        }
 
-        trace!(parent: &self.span, "received {line}");
+        if let Err(err) = self.read.read_exact(&mut prefix[1..]).await {
+            self.errored = true;
+            warn!(parent: &self.span, "[Ipc]: truncated message length prefix: {err}");
+            return None;
+        }
 
-        match serde_json::from_str::<Message>(&line) {
-            Ok(value) => Some(value),
+        let encoded_len = u32::from_be_bytes(prefix) as usize;
+        if encoded_len > MAX_IPC_FRAME_BYTES {
+            self.errored = true;
+            warn!(
+                parent: &self.span,
+                "[Ipc]: rejected oversized message ({encoded_len} bytes; maximum is {MAX_IPC_FRAME_BYTES} bytes)"
+            );
+            return None;
+        }
+
+        self.encoded.resize(encoded_len, 0);
+        if let Err(err) = self.read.read_exact(&mut self.encoded).await {
+            self.errored = true;
+            warn!(
+                parent: &self.span,
+                "[Ipc]: truncated message body (expected {encoded_len} bytes): {err}"
+            );
+            return None;
+        }
+
+        trace!(parent: &self.span, "[Ipc] received binary frame ({encoded_len} bytes)");
+
+        match bincode::serde::decode_from_slice::<Message, _>(
+            &self.encoded,
+            bincode::config::standard(),
+        ) {
+            Ok((value, consumed)) if consumed == encoded_len => Some(value),
+            Ok((_, consumed)) => {
+                self.errored = true;
+                warn!(
+                    parent: &self.span,
+                    "[Ipc]: decoded only {consumed} of {encoded_len} message bytes"
+                );
+                None
+            }
             Err(err) => {
-                warn!(parent: &self.span, "failed to deserialize message: {err:?}");
-
+                self.errored = true;
+                warn!(parent: &self.span, "[Ipc]: failed to decode message: {err}");
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    enum PriorityMessage {
+        Control(u8),
+        Audio(u8),
+        Video(u8),
+    }
+
+    fn encode_frame<Message: Serialize>(message: &Message) -> Vec<u8> {
+        let encoded = bincode::serde::encode_to_vec(message, bincode::config::standard())
+            .expect("test message should encode");
+        let mut frame = Vec::with_capacity(IPC_LENGTH_PREFIX_BYTES + encoded.len());
+        frame.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&encoded);
+        frame
+    }
+
+    fn receiver<Message: DeserializeOwned>(bytes: Vec<u8>) -> IpcReceiver<Message> {
+        IpcReceiver {
+            errored: false,
+            read: create_reader(Cursor::new(bytes)),
+            encoded: Vec::new(),
+            phantom: PhantomData,
+            span: Span::none(),
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build")
+    }
+
+    #[test]
+    fn binary_bytes_round_trip() {
+        let expected = Bytes::from_static(&[0, 1, 2, 3, 0xff, 0, 0x80]);
+        let frame = encode_frame(&StreamerIpcMessage::WebSocketTransport(expected.clone()));
+        let mut receiver = receiver::<StreamerIpcMessage>(frame);
+
+        let received = runtime().block_on(receiver.recv());
+        match received {
+            Some(StreamerIpcMessage::WebSocketTransport(actual)) => {
+                assert_eq!(actual, expected);
+            }
+            _ => panic!("unexpected decoded IPC message"),
+        }
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_without_allocating_body() {
+        let oversized_len = (MAX_IPC_FRAME_BYTES as u32 + 1).to_be_bytes();
+        let mut receiver = receiver::<StreamerIpcMessage>(oversized_len.to_vec());
+
+        assert!(runtime().block_on(receiver.recv()).is_none());
+        assert!(receiver.errored);
+    }
+
+    #[test]
+    fn truncated_frame_is_rejected() {
+        let mut frame = encode_frame(&StreamerIpcMessage::Stop);
+        frame.pop();
+        let mut receiver = receiver::<StreamerIpcMessage>(frame);
+
+        assert!(runtime().block_on(receiver.recv()).is_none());
+        assert!(receiver.errored);
+    }
+
+    #[test]
+    fn reliable_and_realtime_queues_are_independently_bounded() {
+        let (sender, _queues) = priority_channel(Span::none());
+
+        for index in 0..IPC_RELIABLE_QUEUE_CAPACITY {
+            sender
+                .try_send(PriorityMessage::Control(index as u8))
+                .expect("reliable queue should have capacity");
+        }
+        assert!(matches!(
+            sender.try_send(PriorityMessage::Control(0xff)),
+            Err(TrySendError::Full(PriorityMessage::Control(0xff)))
+        ));
+
+        // A full reliable queue does not consume the separately bounded audio
+        // capacity (and vice versa).
+        for index in 0..IPC_REALTIME_QUEUE_CAPACITY {
+            sender
+                .try_send_realtime(PriorityMessage::Audio(index as u8))
+                .expect("realtime queue should have independent capacity");
+        }
+        assert!(matches!(
+            sender.try_send_realtime(PriorityMessage::Audio(0xff)),
+            Err(TrySendError::Full(PriorityMessage::Audio(0xff)))
+        ));
+    }
+
+    #[test]
+    fn priority_order_is_reliable_then_realtime_then_low_priority() {
+        let (sender, mut queues) = priority_channel(Span::none());
+
+        sender
+            .try_send_low_priority(PriorityMessage::Video(1))
+            .expect("first video should fit");
+        assert!(matches!(
+            sender.try_send_low_priority(PriorityMessage::Video(2)),
+            Err(TrySendError::Full(PriorityMessage::Video(2)))
+        ));
+        sender
+            .try_send_realtime(PriorityMessage::Audio(3))
+            .expect("audio should fit independently of video");
+        sender
+            .try_send(PriorityMessage::Control(4))
+            .expect("control should fit independently of media");
+
+        runtime().block_on(async {
+            assert_eq!(
+                next_ipc_message(&mut queues).await,
+                Some(PriorityMessage::Control(4))
+            );
+            assert_eq!(
+                next_ipc_message(&mut queues).await,
+                Some(PriorityMessage::Audio(3))
+            );
+            assert_eq!(
+                next_ipc_message(&mut queues).await,
+                Some(PriorityMessage::Video(1))
+            );
+        });
+    }
+
+    #[test]
+    fn priority_lanes_share_one_binary_framed_writer() {
+        let (sender, queues) = priority_channel(Span::none());
+        sender
+            .try_send_low_priority(PriorityMessage::Video(1))
+            .expect("video should fit");
+        sender
+            .try_send_realtime(PriorityMessage::Audio(2))
+            .expect("audio should fit");
+        sender
+            .try_send(PriorityMessage::Control(3))
+            .expect("control should fit");
+        drop(sender);
+
+        runtime().block_on(async move {
+            let (read, write) = tokio::io::duplex(1_024);
+            let writer = tokio::spawn(ipc_sender(Span::none(), write, queues));
+            let mut receiver = IpcReceiver::<PriorityMessage> {
+                errored: false,
+                read: create_reader(read),
+                encoded: Vec::new(),
+                phantom: PhantomData,
+                span: Span::none(),
+            };
+
+            assert_eq!(receiver.recv().await, Some(PriorityMessage::Control(3)));
+            assert_eq!(receiver.recv().await, Some(PriorityMessage::Audio(2)));
+            assert_eq!(receiver.recv().await, Some(PriorityMessage::Video(1)));
+            assert!(receiver.recv().await.is_none());
+            writer.await.expect("IPC writer task should finish cleanly");
+        });
+    }
+
+    #[test]
+    fn low_priority_video_is_strictly_bounded_to_one_pending_frame() {
+        let (sender, mut queues) = priority_channel(Span::none());
+
+        sender
+            .try_send_low_priority(PriorityMessage::Video(7))
+            .expect("first video should fit");
+        for index in 0..1_000_u16 {
+            assert!(matches!(
+                sender.try_send_low_priority(PriorityMessage::Video((index % 256) as u8)),
+                Err(TrySendError::Full(_))
+            ));
+        }
+
+        assert_eq!(
+            runtime().block_on(next_ipc_message(&mut queues)),
+            Some(PriorityMessage::Video(7))
+        );
+        assert!(queues.low_priority.take().is_none());
+        sender
+            .try_send_low_priority(PriorityMessage::Video(8))
+            .expect("slot should be reusable after it drains");
+    }
+
+    #[test]
+    fn closure_rejects_low_priority_insertion_and_clears_pending_video() {
+        let (sender, queues) = priority_channel(Span::none());
+        sender
+            .try_send_low_priority(PriorityMessage::Video(1))
+            .expect("video should initially fit");
+
+        queues.low_priority.close();
+
+        assert!(queues.low_priority.take().is_none());
+        assert!(matches!(
+            sender.try_send_low_priority(PriorityMessage::Video(2)),
+            Err(TrySendError::Closed(PriorityMessage::Video(2)))
+        ));
+    }
+
+    #[test]
+    fn checked_reliable_send_reports_writer_closure() {
+        let (sender, mut queues) = priority_channel(Span::none());
+        queues.reliable.close();
+
+        assert!(
+            runtime()
+                .block_on(sender.send_checked(PriorityMessage::Control(1)))
+                .is_err()
+        );
     }
 }

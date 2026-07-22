@@ -1,4 +1,3 @@
-import { ByteBuffer } from "../buffer.js";
 import { Logger } from "../log.js";
 import { Pipe, PipeInfo } from "../pipeline/index.js";
 import { addPipePassthrough, DataPipe } from "../pipeline/pipes.js";
@@ -23,8 +22,8 @@ export class DepacketizeVideoPipe implements DataPipe {
     private base: DataVideoRenderer
 
     private lastTimestampMicroseconds = 0
-    private buffer = new ByteBuffer(5)
-
+    private lastRawTimestampMicroseconds: number | null = null
+    private timestampWrapOffsetMicroseconds = 0
     constructor(base: DataVideoRenderer, logger?: Logger) {
         this.implementationName = `depacketize_video -> ${base.implementationName}`
         this.base = base
@@ -33,30 +32,50 @@ export class DepacketizeVideoPipe implements DataPipe {
     }
 
     submitPacket(buffer: ArrayBuffer) {
-        const array = new Uint8Array(buffer)
+        if (buffer.byteLength < 5) {
+            return
+        }
+        const header = new DataView(buffer, 0, 5)
+        const frameType = header.getUint8(0)
+        const rawTimestamp = header.getUint32(1, false)
 
-        this.buffer.reset()
-
-        this.buffer.putU8Array(array.slice(0, 5))
-
-        this.buffer.flip()
-
-        const frameType = this.buffer.getU8()
-        const timestamp = this.buffer.getU32()
+        // The compact wire timestamp is a wrapping u32. Extend it locally so
+        // sessions longer than roughly 71 minutes keep monotonic WebCodecs and
+        // MediaSource timestamps instead of producing a large negative jump.
+        if (
+            this.lastRawTimestampMicroseconds != null &&
+            rawTimestamp < this.lastRawTimestampMicroseconds &&
+            this.lastRawTimestampMicroseconds - rawTimestamp > 0x80000000
+        ) {
+            this.timestampWrapOffsetMicroseconds += 0x100000000
+        }
+        // A reconnect or a duplicated/reordered frame must not produce a
+        // negative WebCodecs duration. Transport delivery is ordered, but the
+        // compact timestamp can still repeat because it is only a u32.
+        const timestamp = Math.max(
+            rawTimestamp + this.timestampWrapOffsetMicroseconds,
+            this.lastTimestampMicroseconds,
+        )
 
         const duration = timestamp - this.lastTimestampMicroseconds
         this.base.submitDecodeUnit({
             type: frameType == 0 ? "delta" : "key",
-            data: array.slice(5).buffer,
+            // Retain a view into the transport-owned frame instead of making
+            // another full encoded-frame copy on every video callback.
+            data: new Uint8Array(buffer, 5),
             durationMicroseconds: duration,
             timestampMicroseconds: timestamp,
         })
         this.lastTimestampMicroseconds = timestamp
+        this.lastRawTimestampMicroseconds = rawTimestamp
 
-        addPipePassthrough(this)
     }
 
     setup(setup: VideoRendererSetup) {
+        this.lastTimestampMicroseconds = 0
+        this.lastRawTimestampMicroseconds = null
+        this.timestampWrapOffsetMicroseconds = 0
+
         if ("setup" in this.base && typeof this.base.setup == "function") {
             return this.base.setup(...arguments)
         }

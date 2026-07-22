@@ -384,6 +384,7 @@ pub struct GetRolesResponse {
 pub enum TransportChannelMethod {
     WebRTC,
     WebSocket,
+    WebTransport,
 }
 
 ts_consts!(
@@ -457,6 +458,7 @@ pub enum StreamSignalingMessage {
 pub enum TransportType {
     WebRTC,
     WebSocket,
+    WebTransport,
 }
 
 #[derive(Serialize, Deserialize, Debug, TS)]
@@ -524,6 +526,9 @@ pub enum StreamServerMessage {
         ice_servers: Vec<RtcIceServer>,
     },
     WebRtc(StreamSignalingMessage),
+    WebTransportSetup {
+        url: String,
+    },
     // Optional Info
     UpdateApp {
         app: App,

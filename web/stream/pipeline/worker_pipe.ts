@@ -55,7 +55,7 @@ export class WorkerPipe implements WorkerReceiver {
     private base: WorkerReceiver
     private pipeline: Pipeline
 
-    constructor(base: WorkerReceiver, pipeline: Pipeline, logger?: Logger) {
+    constructor(base: WorkerReceiver, pipeline: Pipeline, logger?: Logger, options?: unknown) {
         this.implementationName = `worker_pipe [${pipelineToString(pipeline)}] -> ${base.implementationName}`
         this.logger = logger ?? null
 
@@ -69,7 +69,7 @@ export class WorkerPipe implements WorkerReceiver {
         }
 
         this.base = base
-        this.pipeline = pipeline
+        this.pipeline = { ...pipeline, options }
 
         const worker = createPipelineWorker()
         if (!worker) {
@@ -150,8 +150,8 @@ export function workerPipe(name: string, pipeline: Pipeline): PipeStatic {
         static readonly baseType = "workeroutput"
         static readonly type = "workerinput"
 
-        constructor(base: any, logger?: Logger) {
-            super(base, pipeline, logger)
+        constructor(base: any, logger?: Logger, options?: unknown) {
+            super(base, pipeline, logger, options)
         }
     }
 

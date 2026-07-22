@@ -5,7 +5,7 @@ use std::{
     process::exit,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -47,9 +47,9 @@ use tokio::{
     io::{stdin, stdout},
     runtime::Handle,
     spawn,
-    sync::{Mutex, Notify, RwLock},
+    sync::{Mutex, Notify, RwLock, oneshot},
     task::spawn_blocking,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tracing::{Level, level_filters::LevelFilter, span};
 use tracing::{debug, error, info, trace, warn};
@@ -59,7 +59,6 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 
 use crate::{
     audio::StreamAudioDecoder,
-    dynamic_ice_servers::load_dynamic_ice_servers,
     transport::{
         InboundPacket, OutboundPacket, TransportError, TransportEvent, TransportEvents,
         TransportSender, web_socket,
@@ -71,11 +70,13 @@ use crate::{
 pub type RequestClient = TokioHyperClient;
 
 pub const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
+const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const NATIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const IPC_STOP_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
 
 mod audio;
 mod buffer;
 mod convert;
-mod dynamic_ice_servers;
 mod transport;
 mod video;
 
@@ -89,7 +90,7 @@ async fn main() {
 
     // At this point we're authenticated
     let span = span!(Level::TRACE, "ipc");
-    let (mut ipc_sender, mut ipc_receiver) =
+    let (ipc_sender, mut ipc_receiver) =
         create_process_ipc::<ServerIpcMessage, StreamerIpcMessage>(span, stdin(), stdout()).await;
 
     // Send stage
@@ -103,7 +104,7 @@ async fn main() {
         .await;
 
     let (
-        mut config,
+        config,
         host_address,
         host_http_port,
         client_unique_id,
@@ -143,7 +144,8 @@ async fn main() {
                     permissions,
                 );
             }
-            _ => continue,
+            Some(ServerIpcMessage::Stop) | None => return,
+            Some(_) => continue,
         }
     };
 
@@ -201,14 +203,9 @@ async fn main() {
     // -- Configure moonlight
     let moonlight = MoonlightInstance::global().expect("failed to find moonlight");
 
-    // Load dynamic ice servers and append them to the current ice servers
-    let dynamic_ice_servers = load_dynamic_ice_servers(&config.webrtc).await;
-    config
-        .webrtc
-        .ice_servers
-        .extend_from_slice(&dynamic_ice_servers);
-
-    // -- Create and Configure Peer
+    // WebTransport/WebSocket startup must not wait on an unrelated remote ICE
+    // script. The legacy explicit WebRTC path can still use configured static
+    // ICE servers, but this low-latency fork deliberately skips dynamic ICE.
     let ice_servers = config.webrtc.ice_servers.clone();
 
     let connection = StreamConnection::new(
@@ -234,9 +231,6 @@ async fn main() {
     // Wait for termination
     connection.terminate.notified().await;
 
-    // Wait for everything to shutdown (e.g. Moonlight Client, IPC messages)
-    sleep(Duration::from_secs(10)).await;
-
     info!("Terminating Self");
     // Exit streamer
     exit(0);
@@ -252,6 +246,8 @@ struct StreamSetup {
     audio: Option<OpusMultistreamConfig>,
 }
 
+type SharedTransportSender = Arc<dyn TransportSender + Send + Sync + 'static>;
+
 struct StreamConnection {
     pub runtime: Handle,
     pub moonlight: MoonlightInstance,
@@ -266,7 +262,10 @@ struct StreamConnection {
     // Stream
     pub stream: RwLock<Option<MoonlightStream>>,
     pub active_gamepads: RwLock<ActiveGamepads>,
-    pub transport_sender: Mutex<Option<Box<dyn TransportSender + Send + Sync + 'static>>>,
+    pub transport_sender: Mutex<Option<SharedTransportSender>>,
+    transport_dispatch: RwLock<()>,
+    transport_generation: AtomicU64,
+    transport_cancel: Mutex<Option<oneshot::Sender<()>>>,
     // Timeout / Terminate
     pub timeout_terminate_request: Mutex<Option<Instant>>,
     pub terminate: Notify,
@@ -300,6 +299,9 @@ impl StreamConnection {
             stream: RwLock::new(None),
             active_gamepads: RwLock::new(ActiveGamepads::empty()),
             transport_sender: Mutex::new(None),
+            transport_dispatch: RwLock::new(()),
+            transport_generation: AtomicU64::new(0),
+            transport_cancel: Mutex::new(None),
             timeout_terminate_request: Default::default(),
             terminate: Notify::default(),
             is_terminating: AtomicBool::new(false),
@@ -309,7 +311,20 @@ impl StreamConnection {
             let this = Arc::downgrade(&this);
 
             async move {
-                while let Some(message) = ipc_receiver.recv().await {
+                loop {
+                    let message = match ipc_receiver.recv().await {
+                        Some(message) => message,
+                        None => {
+                            let Some(this) = this.upgrade() else {
+                                return;
+                            };
+
+                            info!("Parent IPC closed; stopping streamer");
+                            this.stop().await;
+                            return;
+                        }
+                    };
+
                     let Some(this) = this.upgrade() else {
                         debug!("Received ipc message while the main type is already deallocated");
                         return;
@@ -332,38 +347,70 @@ impl StreamConnection {
         self: &Arc<Self>,
         new_sender: Box<dyn TransportSender + Send + Sync + 'static>,
         mut events: Box<dyn TransportEvents + Send + Sync + 'static>,
+        closed_event_is_final: bool,
     ) {
+        let new_sender: SharedTransportSender = new_sender.into();
         let this = self.clone();
+        // Transport generation changes and event dispatch share this gate. An
+        // event that began on the old generation must finish before handoff;
+        // after handoff, stale tasks cannot pass the read-side generation check.
+        let dispatch_guard = this.transport_dispatch.write().await;
+        let generation = this
+            .transport_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+
+        // Stop the previous event task before its sender is closed. Without an
+        // explicit cancellation, the old task can observe Closed after the new
+        // transport starts and arm the delayed stream-termination timer.
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+        if let Some(old_cancel) = this.transport_cancel.lock().await.replace(cancel_sender) {
+            let _ = old_cancel.send(());
+        }
 
         let old_transport = {
             let mut sender = this.transport_sender.lock().await;
             sender.replace(new_sender)
         };
+        this.clear_terminate_request().await;
 
         spawn({
-            let mut ipc_sender = this.ipc_sender.clone();
+            let ipc_sender = this.ipc_sender.clone();
             let this = Arc::downgrade(&this);
 
             async move {
                 loop {
                     trace!("Polling new transport event");
-                    let event = events.poll_event().await;
+                    let event = tokio::select! {
+                        _ = &mut cancel_receiver => {
+                            debug!(generation, "Transport event task was replaced");
+                            return;
+                        }
+                        event = events.poll_event() => event,
+                    };
                     trace!("Polled transport event");
+
+                    let Some(connection) = this.upgrade() else {
+                        warn!("Failed to get stream connection, stopping listening to events");
+                        return;
+                    };
+                    let _dispatch_guard = connection.transport_dispatch.read().await;
+                    if connection.transport_generation.load(Ordering::Acquire) != generation {
+                        debug!(generation, "Ignoring event from stale transport generation");
+                        return;
+                    }
 
                     match event {
                         Ok(TransportEvent::SendIpc(message)) => {
                             ipc_sender.send(message).await;
                         }
                         Ok(TransportEvent::StartStream { settings }) => {
-                            let Some(this) = this.upgrade() else {
-                                warn!(
-                                    "Failed to get stream connection, stopping listening to events"
-                                );
-                                return;
-                            };
-
-                            let this = this.clone();
+                            let this = connection.clone();
                             spawn(async move {
+                                let _dispatch_guard = this.transport_dispatch.read().await;
+                                if this.transport_generation.load(Ordering::Acquire) != generation {
+                                    return;
+                                }
                                 this.clear_terminate_request().await;
 
                                 if let Err(err) = this.start_stream(settings).await {
@@ -374,48 +421,38 @@ impl StreamConnection {
                             });
                         }
                         Ok(TransportEvent::RecvPacket(packet)) => {
-                            let Some(this) = this.upgrade() else {
-                                warn!(
-                                    "Failed to get stream connection, stopping listening to events"
-                                );
-                                return;
-                            };
-
-                            this.on_packet(packet).await;
+                            connection.on_packet(packet).await;
                         }
-                        Err(TransportError::Closed) | Ok(TransportEvent::Closed) => {
-                            let Some(this) = this.upgrade() else {
-                                warn!(
-                                    "Failed request session termination because of missing stream (maybe it was already terminated)"
-                                );
-                                return;
-                            };
+                        Err(TransportError::Closed) => {
+                            connection.request_terminate().await;
 
-                            this.request_terminate().await;
+                            break;
+                        }
+                        Ok(TransportEvent::Closed) => {
+                            if closed_event_is_final {
+                                connection.stop().await;
+                            } else {
+                                connection.request_terminate().await;
+                            }
 
                             break;
                         }
                         // It wouldn't make sense to return this
                         Err(TransportError::ChannelClosed) => unreachable!(),
                         Err(TransportError::Implementation(err)) => {
-                            let Some(this) = this.upgrade() else {
-                                warn!(
-                                    "Failed to get stream connection, stopping listening to events"
-                                );
-                                return;
-                            };
-
                             info!(
                                 "Stopping stream because of transport implementation error: {err}"
                             );
 
-                            this.stop().await;
+                            connection.stop().await;
                             break;
                         }
                     }
                 }
             }
         });
+
+        drop(dispatch_guard);
 
         if let Some(old_transport) = old_transport {
             spawn(async move {
@@ -426,9 +463,12 @@ impl StreamConnection {
         }
     }
     async fn try_send_packet(&self, packet: OutboundPacket, packet_ty: &str, should_warn: bool) {
-        let mut sender = self.transport_sender.lock().await;
+        // Transport implementations are internally synchronized. Clone the
+        // active handle so a backpressured send cannot block setup, shutdown,
+        // or native audio/video callbacks from acquiring this short-lived lock.
+        let sender = self.transport_sender.lock().await.clone();
 
-        if let Some(sender) = sender.as_mut() {
+        if let Some(sender) = sender {
             if let Err(err) = sender.send(packet).await {
                 if should_warn {
                     warn!("Failed to send outbound packet: {packet_ty}, {err:?}");
@@ -653,19 +693,28 @@ impl StreamConnection {
                                 return;
                             }
                         };
-                        self.set_transport(Box::new(sender), Box::new(events)).await;
+                        // WebRTC only emits Closed for a failed/disconnected
+                        // peer after its own recovery grace has elapsed. Treat
+                        // that event as final so shutdown does not wait through
+                        // the same grace period a second time.
+                        self.set_transport(Box::new(sender), Box::new(events), true)
+                            .await;
                     }
-                    TransportType::WebSocket if self.permissions.allow_transport_websockets => {
-                        info!("Trying Web Socket transport");
+                    TransportType::WebSocket | TransportType::WebTransport
+                        if self.permissions.allow_transport_websockets =>
+                    {
+                        info!("Trying browser relay transport");
 
-                        let (sender, events) = match web_socket::new().await {
+                        let (sender, events) = match web_socket::new(self.ipc_sender.clone()).await
+                        {
                             Ok(value) => value,
                             Err(err) => {
                                 error!("Failed to start web socket transport: {err}");
                                 return;
                             }
                         };
-                        self.set_transport(Box::new(sender), Box::new(events)).await;
+                        self.set_transport(Box::new(sender), Box::new(events), false)
+                            .await;
                     }
                     transport => {
                         warn!(
@@ -680,8 +729,8 @@ impl StreamConnection {
             _ => {}
         }
 
-        let mut sender = self.transport_sender.lock().await;
-        if let Some(sender) = sender.as_mut() {
+        let sender = self.transport_sender.lock().await.clone();
+        if let Some(sender) = sender {
             if let Err(err) = sender.on_ipc_message(message).await {
                 warn!("Failed to send ipc message: {err}");
             }
@@ -704,7 +753,7 @@ impl StreamConnection {
         info!("Starting Moonlight stream with settings: {settings:?}");
 
         // Send stage
-        let mut ipc_sender = self.ipc_sender.clone();
+        let ipc_sender = self.ipc_sender.clone();
         ipc_sender
             .send(StreamerIpcMessage::WebSocket(
                 StreamServerMessage::DebugLog {
@@ -877,16 +926,14 @@ impl StreamConnection {
         stream_guard.replace(stream);
         drop(stream_guard);
 
-        {
-            let mut sender = self.transport_sender.lock().await;
-            match sender.as_mut() {
-                Some(sender) => {
-                    sender.on_setup_complete().await;
-                }
-                None => {
-                    warn!("No transport found after starting stream. Requesting Termination");
-                    self.request_terminate().await;
-                }
+        let sender = self.transport_sender.lock().await.clone();
+        match sender {
+            Some(sender) => {
+                sender.on_setup_complete().await;
+            }
+            None => {
+                warn!("No transport found after starting stream. Requesting Termination");
+                self.request_terminate().await;
             }
         }
 
@@ -898,6 +945,7 @@ impl StreamConnection {
         debug!("Marking for termination");
 
         let this = self.clone();
+        let generation = self.transport_generation.load(Ordering::Acquire);
 
         let mut terminate_request = self.timeout_terminate_request.lock().await;
         *terminate_request = Some(Instant::now());
@@ -906,12 +954,26 @@ impl StreamConnection {
         spawn(async move {
             sleep(TIMEOUT_DURATION + Duration::from_millis(200)).await;
 
+            // A replacement clears the request under the write side of this
+            // gate. Never let a timeout armed by an old transport commit a
+            // stop against the newly installed sender.
+            let _dispatch_guard = this.transport_dispatch.read().await;
+            if this.transport_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+
             let now = Instant::now();
 
-            let terminate_request = this.timeout_terminate_request.lock().await;
-            if let Some(terminate_request) = *terminate_request
-                && (now - terminate_request) > TIMEOUT_DURATION
-            {
+            let should_stop = {
+                let mut terminate_request = this.timeout_terminate_request.lock().await;
+                let should_stop = terminate_request
+                    .is_some_and(|requested_at| now - requested_at > TIMEOUT_DURATION);
+                if should_stop {
+                    *terminate_request = None;
+                }
+                should_stop
+            };
+            if should_stop {
                 info!("Stopping because of timeout");
 
                 this.stop().await;
@@ -938,28 +1000,59 @@ impl StreamConnection {
 
         debug!("[Stream]: Stopping...");
 
+        // Remove both shared handles before native shutdown starts. Native
+        // callbacks can then return immediately instead of waiting on a lock
+        // held by this shutdown path.
+        let stream = self.stream.write().await.take();
+        let transport = { self.transport_sender.lock().await.take() };
+
+        let native_stop = stream.map(|stream| {
+            spawn_blocking(move || {
+                stream.stop();
+            })
+        });
+
+        if let Some(transport) = transport {
+            match timeout(TRANSPORT_CLOSE_TIMEOUT, transport.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("Error whilst closing transport: {err}"),
+                Err(_) => warn!(
+                    "[Stream]: transport close exceeded {:?}; continuing shutdown",
+                    TRANSPORT_CLOSE_TIMEOUT
+                ),
+            }
+        }
+
+        let ipc_sender = self.ipc_sender.clone();
+        match timeout(
+            IPC_STOP_ENQUEUE_TIMEOUT,
+            ipc_sender.send_checked(StreamerIpcMessage::Stop),
+        )
+        .await
         {
-            let mut stream = self.stream.write().await;
-            if let Some(stream) = stream.take() {
-                spawn_blocking(move || {
-                    stream.stop();
-                });
-            }
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => debug!("[Stream]: parent IPC is already closed"),
+            Err(_) => warn!(
+                "[Stream]: IPC stop enqueue exceeded {:?}; continuing local shutdown",
+                IPC_STOP_ENQUEUE_TIMEOUT
+            ),
         }
 
-        let mut transport = self.transport_sender.lock().await;
-        if let Some(transport) = transport.take() {
-            if let Err(err) = transport.close().await {
-                warn!("Error whilst closing transport: {err}");
+        if let Some(native_stop) = native_stop {
+            match timeout(NATIVE_STOP_TIMEOUT, native_stop).await {
+                Ok(Ok(())) => debug!("[Stream]: native stream stopped"),
+                Ok(Err(err)) => warn!("[Stream]: native stop task failed: {err}"),
+                Err(_) => warn!(
+                    "[Stream]: native stream stop exceeded {:?}; forcing streamer exit",
+                    NATIVE_STOP_TIMEOUT
+                ),
             }
-            drop(transport);
         }
-
-        let mut ipc_sender = self.ipc_sender.clone();
-        ipc_sender.send(StreamerIpcMessage::Stop).await;
 
         debug!("Notifying termination");
-        self.terminate.notify_waiters();
+        // There is one process-lifetime waiter. notify_one stores a permit if
+        // shutdown wins the race with main reaching notified().
+        self.terminate.notify_one();
     }
 }
 
@@ -1080,7 +1173,7 @@ impl ConnectionListenerC for StreamConnectionListener {
             return;
         };
 
-        let mut ipc_sender = stream.ipc_sender.clone();
+        let ipc_sender = stream.ipc_sender.clone();
 
         stream.runtime.spawn(async move {
             ipc_sender
@@ -1100,7 +1193,7 @@ impl ConnectionListenerC for StreamConnectionListener {
             return;
         };
 
-        let mut ipc_sender = stream.ipc_sender.clone();
+        let ipc_sender = stream.ipc_sender.clone();
         ipc_sender.blocking_send(StreamerIpcMessage::WebSocket(
             StreamServerMessage::DebugLog {
                 message: format!("Completed Stage: {}", stage.name()),
@@ -1115,7 +1208,7 @@ impl ConnectionListenerC for StreamConnectionListener {
             return;
         };
 
-        let mut ipc_sender = stream.ipc_sender.clone();
+        let ipc_sender = stream.ipc_sender.clone();
         ipc_sender.blocking_send(StreamerIpcMessage::WebSocket(
             StreamServerMessage::DebugLog {
                 message: format!(
@@ -1136,13 +1229,18 @@ impl ConnectionListenerC for StreamConnectionListener {
             return;
         };
 
-        let mut ipc_sender = stream.ipc_sender.clone();
-        ipc_sender.blocking_send(StreamerIpcMessage::WebSocket(
-            StreamServerMessage::ConnectionTerminated { error_code },
-        ));
-
-        stream.runtime.clone().block_on(async move {
-            stream.stop().await;
+        let runtime = stream.runtime.clone();
+        let ipc_sender = stream.ipc_sender.clone();
+        runtime.spawn(async move {
+            // Native code invokes this callback synchronously. Schedule both
+            // operations onto Tokio so the callback returns before stop()
+            // waits for the native connection threads to finish.
+            tokio::join!(
+                ipc_sender.send(StreamerIpcMessage::WebSocket(
+                    StreamServerMessage::ConnectionTerminated { error_code },
+                )),
+                stream.stop(),
+            );
         });
     }
 

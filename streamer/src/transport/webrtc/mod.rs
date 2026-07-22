@@ -542,13 +542,19 @@ impl WebRtcInner {
 
             let now = Instant::now();
 
-            let terminate_request = this.timeout_terminate_request.lock().await;
-            if let Some(terminate_request) = *terminate_request
-                && (now - terminate_request) > TIMEOUT_DURATION
+            let should_terminate = {
+                let terminate_request = this.timeout_terminate_request.lock().await;
+                terminate_request.is_some_and(|requested_at| now - requested_at > TIMEOUT_DURATION)
+            };
+
+            // Never wait for the bounded event queue while holding the timeout
+            // mutex. A recovered peer must remain able to cancel the pending
+            // shutdown through clear_terminate_request().
+            if should_terminate
                 && let Err(err) = this.event_sender.send(TransportEvent::Closed).await
             {
                 warn!("Failed to send that the peer is closed: {err:?}");
-            };
+            }
         });
     }
     async fn clear_terminate_request(&self) {

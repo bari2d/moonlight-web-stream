@@ -67,14 +67,14 @@ export abstract class CodecStreamTranslator {
             return { configure: null, chunk: null, error: false }
         }
 
-        const data = new Uint8Array(unit.data)
+        const data = unit.data
 
         let unitBegin = 0
         let currentPosition = 0
         let currentFrameSize = 0
 
-        let handleStartCode = () => {
-            const slice = data.slice(unitBegin, currentPosition)
+        const handleStartCode = () => {
+            const slice = data.subarray(unitBegin, currentPosition)
 
             const { include } = this.onChunkUnit(slice)
 
@@ -82,12 +82,12 @@ export abstract class CodecStreamTranslator {
                 // Append size + data
                 this.checkFrameBufferSize(currentFrameSize, slice.length + 4)
 
-                // Append size
-                const sizeBuffer = new ByteBuffer(4)
-                sizeBuffer.putU32(slice.length)
-                sizeBuffer.flip()
-
-                this.currentFrame.set(sizeBuffer.getRemainingBuffer(), currentFrameSize)
+                // Append the four-byte big-endian AVCC NAL length directly into
+                // the reusable frame buffer.
+                this.currentFrame[currentFrameSize] = (slice.length >>> 24) & 0xff
+                this.currentFrame[currentFrameSize + 1] = (slice.length >>> 16) & 0xff
+                this.currentFrame[currentFrameSize + 2] = (slice.length >>> 8) & 0xff
+                this.currentFrame[currentFrameSize + 3] = slice.length & 0xff
 
                 // Append data
                 this.currentFrame.set(slice, currentFrameSize + 4)
@@ -125,7 +125,9 @@ export abstract class CodecStreamTranslator {
 
         const { reconfigure } = this.endChunk()
 
-        const chunk = this.currentFrame.slice(0, currentFrameSize)
+        // Consumers synchronously copy this view into EncodedVideoChunk or an
+        // MP4 segment before the translator can reuse currentFrame.
+        const chunk = this.currentFrame.subarray(0, currentFrameSize)
 
         return {
             configure: reconfigure ? this.decoderConfig : null,

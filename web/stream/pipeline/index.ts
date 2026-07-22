@@ -38,7 +38,7 @@ export interface PipeInfoStatic {
 export interface PipeStatic extends PipeInfoStatic, InputPipeStatic {
     readonly type: string
 
-    new(base: any, logger?: Logger): Pipe
+    new(base: any, logger?: Logger, options?: unknown): Pipe
 }
 
 export interface InputPipeStatic {
@@ -52,6 +52,7 @@ export interface OutputPipeStatic {
 
 export type Pipeline = {
     pipes: Array<string | PipeStatic>
+    options?: unknown
 }
 
 export function pipelineToString(pipeline: Pipeline): string {
@@ -94,7 +95,7 @@ export function buildPipeline(base: OutputPipeStatic, pipeline: Pipeline, logger
         }
 
         previousPipeStatic = currentPipe
-        pipe = new currentPipe(pipe, logger)
+        pipe = new currentPipe(pipe, logger, rendererOptions)
     }
 
     return pipe
