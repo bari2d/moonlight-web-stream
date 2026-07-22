@@ -198,8 +198,8 @@ class ViewerApp implements Component {
         }, listenerOptions)
         window.addEventListener("pagehide", () => this.releaseAllInputState(), listenerOptions)
 
-        window.addEventListener("resize", this.scheduleStreamRectRefresh, listenerOptions)
-        window.addEventListener("orientationchange", this.scheduleStreamRectRefresh, listenerOptions)
+        window.addEventListener("resize", this.scheduleViewportRefresh, listenerOptions)
+        window.addEventListener("orientationchange", this.scheduleViewportRefresh, listenerOptions)
         window.visualViewport?.addEventListener("resize", this.scheduleViewportRefresh, listenerOptions)
         window.visualViewport?.addEventListener("scroll", this.scheduleViewportRefresh, listenerOptions)
 
@@ -464,6 +464,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream.getInput().onMouseMove(event, this.getStreamRect())
+        this.scheduleTouchUpdate()
 
         event.stopPropagation()
     }
@@ -1081,8 +1082,8 @@ class ViewerApp implements Component {
         }
         this.streamResizeObserver?.disconnect()
         this.streamMutationObserver?.disconnect()
-        window.removeEventListener("resize", this.scheduleStreamRectRefresh)
-        window.removeEventListener("orientationchange", this.scheduleStreamRectRefresh)
+        window.removeEventListener("resize", this.scheduleViewportRefresh)
+        window.removeEventListener("orientationchange", this.scheduleViewportRefresh)
         window.visualViewport?.removeEventListener("resize", this.scheduleViewportRefresh)
         window.visualViewport?.removeEventListener("scroll", this.scheduleViewportRefresh)
         parent.removeChild(this.div)

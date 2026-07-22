@@ -1,0 +1,198 @@
+[package]
+name = "moonlight-common"
+edition = "2024"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+bitflags = "2.9.1"
+num = "0.4.3"
+num-derive = "0.4.2"
+num-traits = "0.2.19"
+
+tracing = "0.1.44"
+
+thiserror = "2.0.18"
+
+# TODO: should the v4 feature for random be used?
+uuid = { version = "0.8.2", features = ["v4"] }
+hex = "0.4.3"
+pem = "3.0.6"
+roxmltree = "0.21.1"
+form_urlencoded = "1.2.2"
+smallvec = "1.15.1"
+
+# Stream Proto
+fec-rs = { version = "0.1.0", features = ["parallel"], optional = true }
+rusty_enet = { version = "0.4.0", optional = true }
+
+# Stream c
+moonlight-common-sys = { git = "https://github.com/MrCreativ3001/moonlight-common-rust.git", rev = "df9f1e3003fb4834dbb17a4bd4d3cf25d2fea3d9", optional = true }
+
+# Stream Tokio
+# TODO: only pick needed features, maybe also behind a feature lock
+tokio = { version = "1.49.0", default-features = false, features = [
+    "full",
+], optional = true }
+futures = "0.3.32"
+async-trait = "0.1.89"
+
+# -- Request clients
+http = { version = "1.4.0", default-features = false, optional = true }
+hyper = { version = "1.8.1", features = [
+    "client",
+    "http1",
+], default-features = false, optional = true }
+
+# ureq
+ureq = { version = "3.2.0", features = [
+    "rustls",
+], default-features = false, optional = true }
+
+# Hyper Client
+# TODO: rename to tokio hyper
+bytes = { version = "1.11.1", optional = true }
+rustls = { version = "0.23.37", default-features = false, optional = true }
+hyper-util = { version = "0.1.20", features = [
+    "client",
+    "tracing",
+], default-features = false, optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+hyper-rustls = { version = "0.27.7", features = [
+    "http1",
+], default-features = false, optional = true }
+
+# -- Crypto Backends
+# OpenSSL
+openssl = { version = "0.10.73", optional = true }
+
+# Rustcrypto
+sha1 = { version = "0.10.6", default-features = false, optional = true }
+sha2 = { version = "0.10.9", features = [
+    "oid",
+], default-features = false, optional = true }
+# rsa requires this rand version for private key generation
+rand_v8 = { package = "rand", version = "0.8.5", default-features = false, optional = true }
+# when generating js bindings we need get random
+getrandom = { version = "0.2.17", features = ["js"] }
+aes = { version = "0.8.4", default-features = false, optional = true }
+rsa = { version = "0.9.10", features = [
+    "std",
+    "sha2",
+], default-features = false, optional = true }
+# must be this specific version because of some other crate
+der = { version = "0.7.10", default-features = false, optional = true }
+spki = { version = "0", default-features = false, optional = true }
+x509-cert = { version = "0.2.5", features = [
+    "std",
+    "pem",
+    "builder",
+], default-features = false, optional = true }
+pkcs8 = { version = "0.10.2", default-features = false, optional = true }
+signature = { version = "2.2.0", default-features = false, optional = true }
+aes-gcm = { version = "0", default-features = false, features = [
+    "aes",
+], optional = true }
+# this must match the aes version
+cbc = { version = "0.1.2", default-features = false, features = [
+    "block-padding",
+], optional = true }
+
+# Webrtc
+sdp-types = "0.1.8"
+
+# serde serialization for some types
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+
+[features]
+default = ["ureq", "std", "rustcrypto"]
+
+serde = ["dep:serde"]
+
+# Different "runtimes"
+std = ["stream-proto"]
+tokio = ["dep:tokio", "stream-proto"]
+
+# Stream implementations
+stream-proto = ["dep:fec-rs", "dep:rusty_enet"]
+stream-c = ["dep:moonlight-common-sys"]
+
+# Crypto implementations
+openssl = ["dep:openssl"]
+rustcrypto = [
+    "dep:sha1",
+    "dep:sha2",
+    "dep:rand_v8",
+    "dep:aes",
+    "dep:rsa",
+    "dep:der",
+    "dep:spki",
+    "dep:x509-cert",
+    "dep:signature",
+    "dep:pkcs8",
+    "dep:aes-gcm",
+    "dep:cbc",
+]
+
+# Request implementations
+ureq = ["dep:http", "dep:hyper", "dep:ureq"]
+tokio-hyper = [
+    "dep:bytes",
+    "dep:http",
+    "dep:rustls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:hyper-rustls",
+    "tokio",
+]
+
+# Logs sensitive information: e.g. private keys and sensitive values used in encryption / decryption
+__tracing_sensitive = []
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+
+# CLI args for examples
+clap = { version = "4.6.1", features = ["derive"] }
+
+# GStreamer for video and audio playout
+gstreamer = { version = "0.25.1" }
+gstreamer-app = { version = "0.25.0" }
+
+# For testing: very nice logging
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+venator = { version = "1.1.0" }
+
+# openssl version above this version don't compile in cross-rs (x86_64-pc-windows-gnu)
+# See https://github.com/openssl/openssl/issues/29818
+openssl-src = "=300.5.3"
+openssl-sys = "=0.9.109"
+
+[package.metadata.cargo-shear]
+ignored = ["openssl-src", "openssl-sys"]
+
+# Keep the vendored override independently testable without making it a member
+# of the parent application's workspace.
+[workspace]
+resolver = "3"
+
+[[example]]
+name = "client-simple"
+path = "examples/client-simple.rs"
+required-features = ["ureq", "std", "rustcrypto"]
+
+[[example]]
+name = "client-stream"
+path = "examples/client-stream.rs"
+required-features = ["ureq", "std", "rustcrypto"]
+
+[[example]]
+name = "client-common-c"
+path = "examples/client-common-c.rs"
+required-features = ["ureq", "std", "openssl", "stream-c"]
+
+[[example]]
+name = "client-tokio"
+path = "examples/client-tokio.rs"
+required-features = ["tokio-hyper", "tokio", "rustcrypto"]

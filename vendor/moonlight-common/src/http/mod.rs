@@ -1,0 +1,312 @@
+use std::{
+    borrow::Cow,
+    fmt::{self, Debug},
+    net::AddrParseError,
+    num::ParseIntError,
+    str::{FromStr, Utf8Error},
+    string::FromUtf8Error,
+};
+
+use pem::Pem;
+use roxmltree::Error;
+use thiserror::Error;
+use uuid::{Uuid, adapter::Hyphenated};
+
+use crate::{ParseServerStateError, ParseServerVersionError, mac::ParseMacError};
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ParseError {
+    #[error("the response is invalid xml")]
+    ParseXmlError(#[from] Error),
+    #[error("the returned xml doc has a non 200 status code")]
+    InvalidXmlStatusCode { message: Option<String> },
+    #[error("the returned xml doc doesn't have the root node")]
+    XmlRootNotFound,
+    #[error("the text contents of an xml node aren't present: {0}")]
+    XmlTextNotFound(&'static str),
+    #[error("detail was not found: {0}")]
+    DetailNotFound(&'static str),
+    #[error("{0}")]
+    ParseServerStateError(#[from] ParseServerStateError),
+    #[error("{0}")]
+    ParseServerVersionError(#[from] ParseServerVersionError),
+    #[error("parsing server codec mode support")]
+    ParseServerCodecModeSupport,
+    #[error("mac: {0}")]
+    ParseMacError(#[from] ParseMacError),
+    #[error("int: {0}")]
+    ParseIntError(#[from] ParseIntError),
+    #[error("uuid: {0}")]
+    ParseUuidError(#[from] uuid::Error),
+    #[error("hex: {0}")]
+    ParseHexError(#[from] hex::FromHexError),
+    #[error("addr: {0}")]
+    ParseAddrError(#[from] AddrParseError),
+    #[error("pem: {0}")]
+    ParsePem(#[from] pem::PemError),
+    #[error("utf-8: {0}")]
+    Utf8Error(#[from] FromUtf8Error),
+}
+
+pub mod app_list;
+pub mod box_art;
+pub mod cancel;
+pub mod launch;
+pub mod pair;
+pub mod resume;
+pub mod server_info;
+pub mod unpair;
+
+pub mod client;
+
+pub(crate) mod helper;
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod test;
+
+// TODO: what is the correct way to handle errors in this system when receiving messages from a client (server impl)? e.g. failed to start stream, not authenticated for app endpoint?
+// TODO: all response serializations use string formatting -> also use escape sequences when needed
+
+pub const DEFAULT_HTTP_PORT: u16 = 47989;
+pub const DEFAULT_HTTPS_PORT: u16 = 47984;
+
+// TODO: move query related things into their own module, with default impls for &str and String
+#[derive(Debug)]
+pub struct QueryParam<'a> {
+    pub key: &'a str,
+    pub value: &'a str,
+}
+
+#[derive(Debug, Error)]
+pub enum QueryBuilderError {
+    #[error("the query builder buffer is full")]
+    BufferFull,
+}
+
+pub trait QueryBuilder {
+    fn append(&mut self, param: QueryParam) -> Result<(), QueryBuilderError>;
+}
+
+impl QueryBuilder for String {
+    fn append(&mut self, param: QueryParam) -> Result<(), QueryBuilderError> {
+        // TODO: filter for characters that need % serialization
+        if !self.is_empty() {
+            self.push('&');
+        }
+        self.push_str(param.key);
+        self.push('=');
+        self.push_str(param.value);
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FromQueryError {
+    #[error("query param \"{0}\" not found")]
+    QueryParamNotFound(String),
+    #[error("int: {0}")]
+    Int(#[from] ParseIntError),
+    #[error("uuid: {0}")]
+    Uuid(#[from] uuid::Error),
+    #[error("hex: {0}")]
+    Hex(#[from] hex::FromHexError),
+    #[error("pem: {0}")]
+    Pem(#[from] pem::PemError),
+    #[error("utf8: {0}")]
+    Utf8(#[from] Utf8Error),
+    #[error("other: {0}")]
+    Other(String),
+}
+
+pub trait QueryMap {
+    fn has(&self, param: &str) -> bool;
+    fn get<'a>(&'a self, param: &str) -> Result<Cow<'a, str>, FromQueryError>;
+}
+
+impl QueryMap for &str {
+    // TODO: handle %20 and so on
+
+    fn get<'b>(&'b self, param: &str) -> Result<Cow<'b, str>, FromQueryError> {
+        for pair in self.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            if key == param {
+                let value = parts.next().unwrap_or("");
+                return Ok(Cow::Borrowed(value));
+            }
+        }
+        Err(FromQueryError::QueryParamNotFound(param.to_string()))
+    }
+
+    fn has(&self, param: &str) -> bool {
+        self.split('&').any(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            parts.next().unwrap_or("") == param
+        })
+    }
+}
+
+/// This represents an endpoint on the http or https server that a client can query for information or initiate a stream with.
+///
+/// # Custom Client or Server
+///
+/// ## Client Usage
+/// Use the [client::async_client::RequestClient] or [client::blocking_client::RequestClient] when possible to make integration into other systems easier.
+///
+/// For a real implementation see the [RequestClient](client::blocking_client::RequestClient) implementation of [Config](ureq::config::Config)
+///
+/// ## Server Usage
+///
+/// TODO
+///
+pub trait Endpoint {
+    type Request: Request;
+    type Response;
+
+    /// The path of this endpoint. Always begins with a `/`.
+    fn path() -> &'static str;
+
+    /// If this endpoint requires https / authentication
+    ///
+    /// If this returns false an authenticated response could still return a different result than an unauthenticated response.
+    fn https_required() -> bool;
+}
+
+pub trait Request: Sized {
+    /// Serialize the parameters in this request into the query builder.
+    fn append_query_params(
+        &self,
+        query_builder: &mut impl QueryBuilder,
+    ) -> Result<(), QueryBuilderError>;
+
+    // TODO: maybe don't use an iterator, but some kind of map like interface?
+    // TODO: error?
+    /// Parse the query parameters of into this request type.
+    fn from_query_params<Q>(query_map: &Q) -> Result<Self, FromQueryError>
+    where
+        Q: QueryMap;
+}
+
+pub trait TextResponse: FromStr + Debug {
+    fn serialize_into(&self, body_writer: &mut impl fmt::Write) -> fmt::Result;
+}
+
+/// It's recommended to use the same (default) UID for all Moonlight clients so we can quit games started by other Moonlight clients.
+pub const DEFAULT_UNIQUE_ID: &str = "0123456789ABCDEF";
+
+/// The identifier of a client.
+/// Every client request should use this, even when unauthenticated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientInfo {
+    /// It's recommended to use the same (default) UID for all Moonlight clients so we can quit games started by other Moonlight clients.
+    pub unique_id: String,
+    pub uuid: Uuid,
+}
+
+impl Default for ClientInfo {
+    fn default() -> Self {
+        Self {
+            unique_id: DEFAULT_UNIQUE_ID.to_string(),
+            uuid: Uuid::new_v4(),
+        }
+    }
+}
+
+impl Request for ClientInfo {
+    fn append_query_params(
+        &self,
+        query_builder: &mut impl QueryBuilder,
+    ) -> Result<(), QueryBuilderError> {
+        query_builder.append(QueryParam {
+            key: "uniqueid",
+            value: &self.unique_id,
+        })?;
+
+        let mut uuid_bytes = [0; Hyphenated::LENGTH];
+        self.uuid.to_hyphenated_ref().encode_lower(&mut uuid_bytes);
+        let uuid_str = str::from_utf8(&uuid_bytes).expect("uuid string");
+
+        query_builder.append(QueryParam {
+            key: "uuid",
+            value: uuid_str,
+        })?;
+
+        Ok(())
+    }
+
+    fn from_query_params<Q>(query_map: &Q) -> Result<Self, FromQueryError>
+    where
+        Q: QueryMap,
+    {
+        let unique_id = query_map.get("uniqueid")?;
+
+        let uuid_str = query_map.get("uuid")?;
+        let uuid = Uuid::from_str(&uuid_str)?;
+
+        Ok(Self {
+            unique_id: unique_id.into_owned(),
+            uuid,
+        })
+    }
+}
+
+// TODO: use those types instead of directly using Pem
+// TODO: make a from_pem_str fn, so you don't need to include the pem lib
+// TODO: maybe arc the data?
+// TODO: use the der data instead of the whole cert / pk
+
+/// This is used to identify and verify a server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerIdentifier(Pem);
+
+impl ServerIdentifier {
+    pub fn from_pem(pem: Pem) -> Self {
+        // TODO: check for the correct header or tag
+        Self(pem)
+    }
+
+    pub fn to_pem(&self) -> Pem {
+        self.0.clone()
+    }
+}
+
+/// This is used to identify and verify a client.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientIdentifier(Pem);
+
+impl ClientIdentifier {
+    pub fn from_pem(pem: Pem) -> Self {
+        // TODO: check for the correct header or tag
+        Self(pem)
+    }
+
+    pub fn to_pem(&self) -> Pem {
+        self.0.clone()
+    }
+}
+
+/// The secret of the client.
+/// This MUST NOT be shared and MUST be kept secret.
+#[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "__tracing_sensitive", derive(Debug))]
+pub struct ClientSecret(Pem);
+
+impl ClientSecret {
+    pub fn from_pem(pem: Pem) -> Self {
+        // TODO: check for the correct header or tag
+        Self(pem)
+    }
+
+    pub fn to_pem(&self) -> Pem {
+        self.0.clone()
+    }
+}
+
+#[cfg(not(feature = "__tracing_sensitive"))]
+impl Debug for ClientSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[ClientSecret]")
+    }
+}

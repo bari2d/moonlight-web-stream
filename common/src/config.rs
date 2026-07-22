@@ -395,12 +395,14 @@ mod tests {
 
     #[test]
     fn legacy_config_without_web_transport_uses_safe_defaults() {
-        let config: Config = serde_json::from_str("{}").unwrap();
+        let config: Config = serde_json::from_str("{}").expect("empty config should deserialize");
 
         assert!(!config.web_transport.enabled);
         assert_eq!(
             config.web_transport.bind_address,
-            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+            "0.0.0.0:443"
+                .parse::<SocketAddr>()
+                .expect("default bind address should parse")
         );
         assert!(config.web_transport.public_url.is_empty());
         assert!(config.web_transport.certificate_pem.is_empty());
@@ -410,12 +412,13 @@ mod tests {
 
     #[test]
     fn partial_web_transport_config_keeps_field_defaults() {
-        let config: Config = serde_json::from_str(r#"{"web_transport":{"enabled":true}}"#).unwrap();
 
         assert!(config.web_transport.enabled);
         assert_eq!(
             config.web_transport.bind_address,
             "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+                .parse::<SocketAddr>()
+                .expect("default bind address should parse")
         );
         assert_eq!(config.web_transport.token_ttl, Duration::from_secs(60));
     }

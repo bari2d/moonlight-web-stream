@@ -1,19 +1,33 @@
-# Rust / Cargo
-/target/
+# Rust / Cargo build output
+**/target/
 /target-review-generation/
 
-# npm / TypeScript
-/node_modules/
-/dist/
+# The local moonlight-common override is required source. Ignore only the
+# standalone library lockfile; keep .cargo/config.toml and vendor sources.
+/vendor/moonlight-common/Cargo.lock
+**/*.rs.bk
+
+# npm / TypeScript build output
+node_modules/
+dist/
+/coverage/
+/.nyc_output/
+/.pnpm-store/
 /web/api_bindings.ts
 *.tsbuildinfo
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
 
 # Release, runtime, and scratch output
 /finalOutput/
 /bindings/
 /ignore/
 /server/
+*.profraw
+*.profdata
 
 # Locally unpacked build toolchains
 /strawberry-perl-*/
@@ -27,9 +41,26 @@ npm-debug.log*
 # Python caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
-# Editors / operating systems
-/.vscode/
-/.idea/
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Operating systems and crash output
 .DS_Store
 Thumbs.db
+Desktop.ini
+*.dmp
+*.stackdump

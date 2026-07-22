@@ -1,0 +1,113 @@
+use std::{fmt, str::FromStr};
+
+use roxmltree::Document;
+
+use crate::http::{
+    FromQueryError, ParseError, QueryBuilder, QueryBuilderError, QueryMap, QueryParam, Request,
+    TextResponse,
+    helper::{parse_xml_child_text, parse_xml_root_node},
+    pair::parse_xml_child_paired,
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairPhase2Request {
+    pub device_name: String,
+    pub encrypted_challenge: Vec<u8>,
+}
+
+impl Request for PairPhase2Request {
+    fn append_query_params(
+        &self,
+        query_builder: &mut impl QueryBuilder,
+    ) -> Result<(), QueryBuilderError> {
+        query_builder.append(QueryParam {
+            key: "devicename",
+            value: &self.device_name,
+        })?;
+        query_builder.append(QueryParam {
+            key: "updateState",
+            value: "1",
+        })?;
+
+        let encrypted_challenge_str = hex::encode_upper(&self.encrypted_challenge);
+        query_builder.append(QueryParam {
+            key: "clientchallenge",
+            value: &encrypted_challenge_str,
+        })?;
+
+        Ok(())
+    }
+
+    fn from_query_params<Q>(query_map: &Q) -> Result<Self, FromQueryError>
+    where
+        Q: QueryMap,
+    {
+        let device_name = query_map.get("devicename")?;
+
+        // TODO: check update_state?
+        // let update_state: i32 = query_map.get("updateState")?.parse()?;
+
+        let encrypted_challenge_hex = query_map.get("clientchallenge")?;
+        let encrypted_challenge = hex::decode(encrypted_challenge_hex.as_bytes())?;
+
+        Ok(Self {
+            device_name: device_name.into_owned(),
+            encrypted_challenge,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairPhase2Response {
+    pub paired: bool,
+    /// Encrypted response contains when unencrypted:
+    /// 0..[HashAlgorithm::hash_len()](crate::http::pair::HashAlgorithm::hash_len()): The response hash
+    /// [HashAlgorithm::hash_len()](crate::http::pair::HashAlgorithm::hash_len())..hash_len() + [CHALLENGE_LENGTH](crate::http::pair::CHALLENGE_LENGTH): The server challenge
+    pub encrypted_response: Vec<u8>,
+}
+
+impl TextResponse for PairPhase2Response {
+    fn serialize_into(&self, body_writer: &mut impl fmt::Write) -> fmt::Result {
+        // XML header + root
+        body_writer.write_str(r#"<?xml version="1.0" encoding="utf-8"?>"#)?;
+        body_writer.write_str(r#"<root status_code="200">"#)?;
+
+        // <paired>
+        write!(
+            body_writer,
+            "<paired>{}</paired>",
+            if self.paired { 1 } else { 0 }
+        )?;
+
+        // <challengeresponse>
+        let challenge_response = hex::encode_upper(&self.encrypted_response);
+        write!(
+            body_writer,
+            "<challengeresponse>{challenge_response}</challengeresponse>"
+        )?;
+
+        // close root
+        body_writer.write_str("</root>")?;
+
+        Ok(())
+    }
+}
+
+impl FromStr for PairPhase2Response {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let doc = Document::parse(s)?;
+        let root = parse_xml_root_node(&doc)?;
+
+        let paired = parse_xml_child_paired(root)?;
+
+        let challenge_response_str = parse_xml_child_text(root, "challengeresponse")?;
+        let challenge_response = hex::decode(challenge_response_str)?;
+
+        Ok(PairPhase2Response {
+            paired,
+            encrypted_response: challenge_response,
+        })
+    }
+}

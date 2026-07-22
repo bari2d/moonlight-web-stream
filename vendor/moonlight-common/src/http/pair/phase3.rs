@@ -1,0 +1,110 @@
+use std::{fmt, str::FromStr};
+
+use roxmltree::Document;
+
+use crate::http::{
+    FromQueryError, ParseError, QueryBuilder, QueryBuilderError, QueryMap, QueryParam, Request,
+    TextResponse,
+    helper::{parse_xml_child_text, parse_xml_root_node},
+    pair::parse_xml_child_paired,
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairPhase3Request {
+    pub device_name: String,
+    pub encrypted_challenge_response_hash: Vec<u8>,
+}
+
+impl Request for PairPhase3Request {
+    fn append_query_params(
+        &self,
+        query_builder: &mut impl QueryBuilder,
+    ) -> Result<(), QueryBuilderError> {
+        query_builder.append(QueryParam {
+            key: "devicename",
+            value: &self.device_name,
+        })?;
+        query_builder.append(QueryParam {
+            key: "updateState",
+            value: "1",
+        })?;
+
+        let encrypted_challenge_str = hex::encode_upper(&self.encrypted_challenge_response_hash);
+        query_builder.append(QueryParam {
+            key: "serverchallengeresp",
+            value: &encrypted_challenge_str,
+        })?;
+
+        Ok(())
+    }
+
+    fn from_query_params<Q>(query_map: &Q) -> Result<Self, FromQueryError>
+    where
+        Q: QueryMap,
+    {
+        let device_name = query_map.get("devicename")?;
+
+        // TODO: check update_state?
+        // let update_state: i32 = query_map.get("updateState")?.parse()?;
+
+        let encrypted_challenge_hex = query_map.get("serverchallengeresp")?;
+        let encrypted_challenge_response_hash = hex::decode(encrypted_challenge_hex.as_bytes())?;
+
+        Ok(Self {
+            device_name: device_name.into_owned(),
+            encrypted_challenge_response_hash,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairPhase3Response {
+    pub paired: bool,
+    pub server_pairing_secret: Vec<u8>,
+}
+
+impl TextResponse for PairPhase3Response {
+    fn serialize_into(&self, body_writer: &mut impl fmt::Write) -> fmt::Result {
+        // XML header + root
+        body_writer.write_str(r#"<?xml version="1.0" encoding="utf-8"?>"#)?;
+        body_writer.write_str(r#"<root status_code="200">"#)?;
+
+        // <pairingsecret>
+        let pairing_secret = hex::encode_upper(&self.server_pairing_secret);
+        write!(
+            body_writer,
+            "<pairingsecret>{pairing_secret}</pairingsecret>"
+        )?;
+
+        // <paired>
+        write!(
+            body_writer,
+            "<paired>{}</paired>",
+            if self.paired { 1 } else { 0 }
+        )?;
+
+        // close root
+        body_writer.write_str("</root>")?;
+
+        Ok(())
+    }
+}
+
+impl FromStr for PairPhase3Response {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let doc = Document::parse(s)?;
+        let root = parse_xml_root_node(&doc)?;
+
+        let paired = parse_xml_child_paired(root)?;
+
+        let pairing_secret_str = parse_xml_child_text(root, "pairingsecret")?;
+        let pairing_secret = hex::decode(pairing_secret_str)?;
+
+        Ok(PairPhase3Response {
+            paired,
+            server_pairing_secret: pairing_secret,
+        })
+    }
+}

@@ -81,7 +81,43 @@ struct WebRtcInner {
     video: Mutex<WebRtcVideo>,
     audio: Mutex<WebRtcAudio>,
     // Timeout / Terminate
-    pub timeout_terminate_request: Mutex<Option<Instant>>,
+    termination_state: Mutex<TerminationState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminationRequest {
+    generation: u64,
+    requested_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct TerminationState {
+    next_generation: u64,
+    pending: Option<TerminationRequest>,
+}
+
+impl TerminationState {
+    fn request(&mut self, requested_at: Instant) -> TerminationRequest {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let request = TerminationRequest {
+            generation: self.next_generation,
+            requested_at,
+        };
+        self.pending = Some(request);
+        request
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    fn is_current_and_expired(&self, request: TerminationRequest, now: Instant) -> bool {
+        self.pending.is_some_and(|pending| {
+            pending.generation == request.generation
+                && pending.requested_at == request.requested_at
+                && now.saturating_duration_since(request.requested_at) > TIMEOUT_DURATION
+        })
+    }
 }
 
 pub async fn new(
@@ -172,7 +208,7 @@ pub async fn new(
             Arc::downgrade(&peer),
             audio_sample_queue_size,
         )),
-        timeout_terminate_request: Mutex::new(None),
+        termination_state: Mutex::new(TerminationState::default()),
     });
 
     // Add all data channels. The server creates all data channels
@@ -533,40 +569,57 @@ impl WebRtcInner {
     async fn request_terminate(self: &Arc<Self>) {
         let this = self.clone();
 
-        let mut terminate_request = self.timeout_terminate_request.lock().await;
-        *terminate_request = Some(Instant::now());
-        drop(terminate_request);
+        let request = self.termination_state.lock().await.request(Instant::now());
 
         spawn(async move {
             sleep(TIMEOUT_DURATION + Duration::from_millis(200)).await;
 
-            let now = Instant::now();
-
             let should_terminate = {
-                let terminate_request = this.timeout_terminate_request.lock().await;
-                terminate_request.is_some_and(|requested_at| now - requested_at > TIMEOUT_DURATION)
+                this.termination_state
+                    .lock()
+                    .await
+                    .is_current_and_expired(request, Instant::now())
             };
 
-            // Never wait for the bounded event queue while holding the timeout
-            // mutex. A recovered peer must remain able to cancel the pending
-            // shutdown through clear_terminate_request().
-            if should_terminate
-                && let Err(err) = this.event_sender.send(TransportEvent::Closed).await
-            {
-                warn!("Failed to send that the peer is closed: {err:?}");
+            if should_terminate {
+                match send_closed_if_current(&this.event_sender, &this.termination_state, request)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) => warn!("Failed to send that the peer is closed: {err:?}"),
+                }
             }
         });
     }
     async fn clear_terminate_request(&self) {
-        let mut request = self.timeout_terminate_request.lock().await;
+        self.termination_state.lock().await.clear();
+    }
+}
 
-        *request = None;
+async fn send_closed_if_current(
+    event_sender: &Sender<TransportEvent>,
+    termination_state: &Mutex<TerminationState>,
+    request: TerminationRequest,
+) -> Result<bool, tokio::sync::mpsc::error::SendError<()>> {
+    // Reserve capacity without holding the termination mutex so a recovered
+    // peer can invalidate this request even while the event queue is full.
+    let permit = event_sender.reserve().await?;
+
+    // Revalidate the exact request after the await. Keep the guard through the
+    // synchronous send so a reconnect cannot clear it between check and send.
+    let state = termination_state.lock().await;
+    if state.is_current_and_expired(request, Instant::now()) {
+        permit.send(TransportEvent::Closed);
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc::error::TryRecvError;
 
     #[test]
     fn mouse_labels_map_to_their_logical_channels() {
@@ -592,6 +645,49 @@ mod tests {
         );
         assert!(transport_channel_for_label("controller16").is_none());
         assert!(transport_channel_for_label("controller_invalid").is_none());
+    }
+
+    #[test]
+    fn reconnect_cancels_a_terminal_event_waiting_for_queue_capacity() {
+        tokio::runtime::Runtime::new()
+            .expect("failed to create test runtime")
+            .block_on(async {
+                let (sender, mut receiver) = channel(1);
+                sender
+                    .send(TransportEvent::Closed)
+                    .await
+                    .expect("failed to fill test event queue");
+
+                let state = Arc::new(Mutex::new(TerminationState::default()));
+                let request = state
+                    .lock()
+                    .await
+                    .request(Instant::now() - TIMEOUT_DURATION - Duration::from_millis(1));
+
+                let task = spawn({
+                    let sender = sender.clone();
+                    let state = state.clone();
+                    async move { send_closed_if_current(&sender, &state, request).await }
+                });
+
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "terminal event should be waiting for queue capacity"
+                );
+
+                state.lock().await.clear();
+                assert!(matches!(
+                    receiver.recv().await,
+                    Some(TransportEvent::Closed)
+                ));
+                assert_eq!(
+                    task.await.expect("termination task panicked"),
+                    Ok(false),
+                    "a reconnect must invalidate the queued terminal event"
+                );
+                assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+            });
     }
 }
 

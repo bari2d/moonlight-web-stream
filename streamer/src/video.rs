@@ -14,28 +14,6 @@ use moonlight_common::stream::{
 
 use crate::{StreamConnection, transport::OutboundPacket};
 
-const UPSTREAM_TIMESTAMP_TICKS_PER_SECOND: u128 = 90_000;
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
-
-/// Undo the timestamp unit conversion in the pinned moonlight-common C adapter.
-///
-/// The C callback's `presentationTimeUs` is already measured in microseconds,
-/// but the pinned adapter treats it as a 90 kHz timestamp when constructing a
-/// `Duration`. Normalize it once at decoder ingress so every transport and
-/// stats consumer sees the original presentation time. Remove this when the
-/// pinned dependency fixes its C adapter.
-fn normalize_pinned_c_timestamp(timestamp: Duration) -> Duration {
-    let micros = timestamp
-        .as_nanos()
-        .checked_mul(UPSTREAM_TIMESTAMP_TICKS_PER_SECOND)
-        .and_then(|scaled| scaled.checked_add(NANOS_PER_SECOND / 2))
-        .map(|rounded| rounded / NANOS_PER_SECOND)
-        .unwrap_or(u128::MAX)
-        .min(u64::MAX as u128) as u64;
-
-    Duration::from_micros(micros)
-}
-
 pub(crate) struct StreamVideoDecoder {
     pub(crate) stream: Weak<StreamConnection>,
     pub(crate) supported_formats: VideoFormats,
@@ -75,9 +53,6 @@ impl VideoDecoder for StreamVideoDecoder {
     fn stop(&mut self) {}
 
     fn submit_decode_unit(&mut self, unit: VideoDecodeUnit<&[u8]>) -> DecodeResult {
-        let mut unit = unit;
-        unit.timestamp = normalize_pinned_c_timestamp(unit.timestamp);
-
         let Some(stream) = self.stream.upgrade() else {
             warn!("Failed to send video decode unit because stream is deallocated");
             return DecodeResult::Ok;
@@ -123,29 +98,25 @@ impl VideoDecoder for StreamVideoDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_pinned_c_timestamp;
     use std::time::Duration;
 
-    fn pinned_c_timestamp(presentation_time_us: u64) -> Duration {
-        Duration::from_nanos(presentation_time_us.saturating_mul(1_000_000_000) / 90_000)
-    }
+    use moonlight_common::stream::c::video::presentation_timestamp_from_raw_micros;
 
     #[test]
-    fn normalizes_representative_presentation_timestamps() {
-        for presentation_time_us in [0, 1, 16_667, 1_000_000, 3_600_000_000] {
+    fn adapter_timestamp_preserves_values_past_old_overflow_boundary() {
+        let old_overflow_boundary = u64::MAX / 1_000_000_000 + 1;
+
+        for presentation_time_us in [
+            old_overflow_boundary - 1,
+            old_overflow_boundary,
+            old_overflow_boundary + 1,
+            u64::MAX,
+        ] {
             assert_eq!(
-                normalize_pinned_c_timestamp(pinned_c_timestamp(presentation_time_us)),
+                presentation_timestamp_from_raw_micros(presentation_time_us),
                 Duration::from_micros(presentation_time_us)
             );
         }
-    }
-
-    #[test]
-    fn timestamp_normalization_saturates_instead_of_overflowing() {
-        assert_eq!(
-            normalize_pinned_c_timestamp(Duration::MAX),
-            Duration::from_micros(u64::MAX)
-        );
     }
 }
 

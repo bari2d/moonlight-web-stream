@@ -30,7 +30,7 @@ const CONTROLLER_STATE_REFRESH_INTERVAL_MS = 250
 const I16_MIN = -I16_MAX - 1
 const MAX_RELATIVE_MOUSE_CHUNKS = 64
 const RELATIVE_MOUSE_FLUSH_INTERVAL_MS = 4
-const MAX_TEXT_PACKET_BYTES = U8_MAX
+const MAX_TEXT_PACKET_CHARACTERS = U8_MAX
 
 const TOUCH_EVENT_DOWN = 0
 const TOUCH_EVENT_MOVE = 1
@@ -87,27 +87,33 @@ function trySendChannel(channel: DataTransportChannel | null, buffer: ByteBuffer
     channel.send(readBuffer.buffer)
 }
 
-function* encodeTextChunks(text: string): Generator<Uint8Array> {
-    const encoded = new TextEncoder().encode(text)
-    if (encoded.length == 0) {
-        yield encoded
-        return
+type EncodedTextChunk = {
+    bytes: Uint8Array
+    characterCount: number
+}
+
+function* encodeTextChunks(text: string): Generator<EncodedTextChunk> {
+    const encoder = new TextEncoder()
+    let characters: string[] = []
+
+    // The wire length is a Unicode-scalar count, not a UTF-8 byte count.
+    // A 255-character chunk is at most 1,020 bytes and fits the input buffer.
+    for (const character of text) {
+        characters.push(character)
+        if (characters.length == MAX_TEXT_PACKET_CHARACTERS) {
+            yield {
+                bytes: encoder.encode(characters.join("")),
+                characterCount: characters.length,
+            }
+            characters = []
+        }
     }
 
-    let start = 0
-    while (start < encoded.length) {
-        let end = Math.min(start + MAX_TEXT_PACKET_BYTES, encoded.length)
-
-        // Each packet is decoded independently on the streamer, so keep UTF-8
-        // code points intact when the byte limit falls in the middle of one.
-        if (end < encoded.length) {
-            while (end > start && (encoded[end] & 0xc0) == 0x80) {
-                end--
-            }
+    if (characters.length > 0 || text.length == 0) {
+        yield {
+            bytes: encoder.encode(characters.join("")),
+            characterCount: characters.length,
         }
-
-        yield encoded.subarray(start, end)
-        start = end
     }
 }
 
@@ -334,8 +340,8 @@ export class StreamInput {
             this.buffer.reset()
 
             this.buffer.putU8(1)
-            this.buffer.putU8(chunk.length)
-            this.buffer.putU8Array(chunk)
+            this.buffer.putU8(chunk.characterCount)
+            this.buffer.putU8Array(chunk.bytes)
 
             trySendChannel(this.keyboard, this.buffer)
         }

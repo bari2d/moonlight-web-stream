@@ -1,6 +1,6 @@
 import { globalObject } from "../../util.js";
 import { Logger } from "../log.js";
-import { BaseCanvasVideoRenderer } from "../video/canvas.js";
+import { BaseCanvasVideoRenderer, CanvasVideoRendererOptions } from "../video/canvas.js";
 import { CanvasRenderer, DataVideoRenderer, FrameVideoRenderer, TrackVideoRenderer, UseCanvasResult, VideoDecodeUnit, VideoRendererSetup } from "../video/index.js";
 import { Pipe, PipeInfo } from "./index.js";
 import { addPipePassthrough, DataPipe } from "./pipes.js";
@@ -145,12 +145,14 @@ export class WorkerOffscreenCanvasSendPipe extends WorkerSenderPipe implements C
 
     implementationName: string = "offscreen_canvas_send"
 
-    constructor(base: WorkerPipe, logger?: Logger) {
+    constructor(base: WorkerPipe, logger?: Logger, options?: unknown) {
         super(base, logger)
 
-        this.renderer = new BaseCanvasVideoRenderer("offscreen_canvas", {
-            drawOnSubmit: true
-        })
+        const rendererOptions = options as CanvasVideoRendererOptions | undefined
+        this.renderer = new BaseCanvasVideoRenderer(
+            "offscreen_canvas",
+            rendererOptions ?? { drawOnSubmit: true }
+        )
 
         addPipePassthrough(this)
     }

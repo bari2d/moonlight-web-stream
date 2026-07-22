@@ -27,7 +27,7 @@ const MAX_VIDEO_SEQUENCE_GAP = 32
 const VIDEO_REORDER_DEADLINE_MS = 50
 const VIDEO_RECOVERY_RETRY_MS = 250
 const CLOSE_DRAIN_TIMEOUT_MS = 250
-const PROTOCOL_VERSION = "2"
+const PROTOCOL_VERSION = "3"
 
 const LANE_VIDEO_FRAME = 1
 const LANE_AUDIO = 2
@@ -42,15 +42,17 @@ type ChannelSender = (id: TransportChannelIdValue, message: ArrayBuffer) => void
 type BufferedBytesReader = () => number | null
 
 type ReliableFrame = {
-    id: TransportChannelIdValue
+    id: number
     payload: ArrayBuffer
     bufferedBytes: number
     enqueuedAt: number
+    snapshotId: TransportChannelIdValue | null
 }
 
 type PendingDatagram = {
     data: Uint8Array
     id: TransportChannelIdValue
+    sequence: number
     payload: ArrayBuffer
 }
 
@@ -61,16 +63,17 @@ type PendingVideoFrame = {
 }
 
 /**
- * WebTransport protocol v2.
+ * WebTransport protocol v3.
  *
  * Server video uses one independently resettable unidirectional stream per
  * frame: lane byte 1, u32-BE wrapping sequence, u32-BE frame length, then the
  * existing channel-prefixed frame. Audio (lane 2) and other reliable data
  * (lane 3) remain ordered persistent lanes with repeated length-prefixed
  * frames. The client opens lane 4. Relative motion and clicks share that lane
- * so input barriers retain their ordering. Only replaceable absolute
- * mouse/controller snapshots use QUIC datagrams beginning with DATAGRAM_MAGIC
- * when the browser exposes them; otherwise they are coalesced onto lane 4.
+ * so input barriers retain their ordering. Replaceable controller snapshots
+ * use QUIC datagrams beginning with DATAGRAM_MAGIC when the browser exposes
+ * them. Absolute mouse snapshots stay on lane 4 so they cannot overtake the
+ * reliable position + click barrier used by point-and-drag input.
  */
 export class WebTransportTransport implements Transport {
     readonly implementationName = "web_transport"
@@ -301,17 +304,21 @@ export class WebTransportTransport implements Transport {
             return
         }
 
-        if (
-            id == TransportChannelId.MOUSE_ABSOLUTE ||
-            (id >= TransportChannelId.CONTROLLER0 && id <= TransportChannelId.CONTROLLER15)
-        ) {
+        if (id == TransportChannelId.MOUSE_ABSOLUTE) {
+            const sequence = ((this.snapshotSequences.get(id) ?? 0) + 1) >>> 0
+            this.snapshotSequences.set(id, sequence)
+            this.queueReliableSnapshot(id, sequence, message)
+            return
+        }
+
+        if (id >= TransportChannelId.CONTROLLER0 && id <= TransportChannelId.CONTROLLER15) {
             const sequence = ((this.snapshotSequences.get(id) ?? 0) + 1) >>> 0
             this.snapshotSequences.set(id, sequence)
             if (this.queueSnapshotDatagram(id, sequence, message)) {
                 return
             }
             this.datagramFallbacks++
-            this.queueReliable(id, message, true)
+            this.queueReliableSnapshot(id, sequence, message)
             return
         }
 
@@ -328,7 +335,17 @@ export class WebTransportTransport implements Transport {
             return false
         }
 
-        const data = new Uint8Array(size)
+        const data = this.encodeSnapshotEnvelope(id, sequence, payload)
+        this.putLatestDatagram(id + DATAGRAM_SNAPSHOT_HEADER_BYTES, data, id, sequence, payload)
+        return true
+    }
+
+    private encodeSnapshotEnvelope(
+        id: TransportChannelIdValue,
+        sequence: number,
+        payload: ArrayBuffer,
+    ): Uint8Array {
+        const data = new Uint8Array(DATAGRAM_SNAPSHOT_HEADER_BYTES + payload.byteLength)
         const view = new DataView(data.buffer)
         view.setUint8(0, DATAGRAM_MAGIC)
         view.setUint8(1, DATAGRAM_SNAPSHOT)
@@ -336,20 +353,32 @@ export class WebTransportTransport implements Transport {
         view.setUint16(3, this.epoch, false)
         view.setUint32(5, sequence, false)
         data.set(new Uint8Array(payload), DATAGRAM_SNAPSHOT_HEADER_BYTES)
-        this.putLatestDatagram(id + DATAGRAM_SNAPSHOT_HEADER_BYTES, data, id, payload)
-        return true
+        return data
+    }
+
+    private queueReliableSnapshot(
+        id: TransportChannelIdValue,
+        sequence: number,
+        payload: ArrayBuffer,
+    ): void {
+        // Send the same epoch/sequence envelope on the reliable lane. The
+        // server shares ordering state between both delivery paths, so a
+        // delayed older datagram cannot overwrite this newer snapshot.
+        const envelope = this.encodeSnapshotEnvelope(id, sequence, payload)
+        this.queueReliable(DATAGRAM_MAGIC, envelope.slice(1).buffer, id)
     }
 
     private putLatestDatagram(
         key: number,
         data: Uint8Array,
         id: TransportChannelIdValue,
+        sequence: number,
         payload: ArrayBuffer,
     ): void {
         if (this.pendingDatagrams.has(key)) {
             this.datagramsReplaced++
         }
-        this.pendingDatagrams.set(key, { data, id, payload })
+        this.pendingDatagrams.set(key, { data, id, sequence, payload })
         void this.pumpDatagrams()
     }
 
@@ -400,7 +429,7 @@ export class WebTransportTransport implements Transport {
                 } catch (_releaseError) { }
                 for (const packet of fallbackSnapshots) {
                     this.datagramFallbacks++
-                    this.queueReliable(packet.id, packet.payload, true)
+                    this.queueReliableSnapshot(packet.id, packet.sequence, packet.payload)
                 }
             }
         } finally {
@@ -412,9 +441,9 @@ export class WebTransportTransport implements Transport {
     }
 
     private queueReliable(
-        id: TransportChannelIdValue,
+        id: number,
         payload: ArrayBuffer,
-        replaceableSnapshot: boolean = false,
+        replaceableSnapshotId: TransportChannelIdValue | null = null,
     ): void {
         const bufferedBytes = 5 + payload.byteLength
         if (payload.byteLength + 1 > MAX_RELIABLE_FRAME_BYTES) {
@@ -423,7 +452,7 @@ export class WebTransportTransport implements Transport {
             return
         }
 
-        if (!replaceableSnapshot) {
+        if (replaceableSnapshotId == null) {
             // Never replace a snapshot across a reliable key/button/control
             // barrier. A later snapshot starts a fresh replaceable segment.
             this.pendingReliableSnapshots.clear()
@@ -443,7 +472,7 @@ export class WebTransportTransport implements Transport {
                 return
             }
         } else {
-            const pending = this.pendingReliableSnapshots.get(id)
+            const pending = this.pendingReliableSnapshots.get(replaceableSnapshotId)
             if (pending) {
                 const nextQueuedBytes = this.reliableQueuedBytes - pending.bufferedBytes + bufferedBytes
                 if (nextQueuedBytes + this.reliableInFlightBytes > MAX_RELIABLE_QUEUED_BYTES) {
@@ -469,7 +498,13 @@ export class WebTransportTransport implements Transport {
             return
         }
 
-        const frame = { id, payload, bufferedBytes, enqueuedAt: performance.now() }
+        const frame = {
+            id,
+            payload,
+            bufferedBytes,
+            enqueuedAt: performance.now(),
+            snapshotId: replaceableSnapshotId,
+        }
         // Decoder recovery must not wait behind a backlog of user input. It is
         // independent of input ordering and is idempotently latched upstream.
         if (id == TransportChannelId.HOST_VIDEO) {
@@ -477,8 +512,8 @@ export class WebTransportTransport implements Transport {
         } else {
             this.reliableQueue.push(frame)
         }
-        if (replaceableSnapshot) {
-            this.pendingReliableSnapshots.set(id, frame)
+        if (replaceableSnapshotId != null) {
+            this.pendingReliableSnapshots.set(replaceableSnapshotId, frame)
         }
         this.reliableQueuedBytes += bufferedBytes
         this.maxReliableQueuedBytes = Math.max(this.maxReliableQueuedBytes, this.reliableQueuedBytes)
@@ -537,8 +572,11 @@ export class WebTransportTransport implements Transport {
                 if (!frame) {
                     continue
                 }
-                if (this.pendingReliableSnapshots.get(frame.id) == frame) {
-                    this.pendingReliableSnapshots.delete(frame.id)
+                if (
+                    frame.snapshotId != null &&
+                    this.pendingReliableSnapshots.get(frame.snapshotId) == frame
+                ) {
+                    this.pendingReliableSnapshots.delete(frame.snapshotId)
                 }
                 this.reliableQueuedBytes -= frame.bufferedBytes
                 this.reliableInFlightBytes = frame.bufferedBytes

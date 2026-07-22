@@ -1,0 +1,3 @@
+# Keep the Git package identity and lockfile pin while compiling the local
+# adapter correction. See ../vendor/moonlight-common/UPSTREAM.md.
+paths = ["vendor/moonlight-common"]

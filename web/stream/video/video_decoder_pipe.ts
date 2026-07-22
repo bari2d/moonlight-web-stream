@@ -184,6 +184,7 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     private decoderSetupFinished = false
     private requestedIdr = false
     private needsKeyFrame = true
+    private setupBufferNeedsKeyFrame = false
 
     private bufferedUnits: Array<VideoDecodeUnit> = []
     submitDecodeUnit(unit: VideoDecodeUnit): void {
@@ -197,13 +198,23 @@ export class VideoDecoderPipe implements DataVideoRenderer {
             // prefix before the decoder is ready.
             if (unit.type == "key") {
                 this.bufferedUnits.length = 0
-            }
-            if (
-                (this.bufferedUnits.length > 0 || unit.type == "key") &&
-                this.bufferedUnits.length < MAX_SETUP_BUFFERED_UNITS
-            ) {
+                this.setupBufferNeedsKeyFrame = false
+                this.requestedIdr = false
                 this.bufferedUnits.push(unit)
+                return
             }
+            if (this.setupBufferNeedsKeyFrame || this.bufferedUnits.length == 0) {
+                return
+            }
+            if (this.bufferedUnits.length >= MAX_SETUP_BUFFERED_UNITS) {
+                // Dropping a delta creates a reference-frame gap. Discard the
+                // whole buffered GOP and wait for a new key frame instead of
+                // replaying a prefix and then decoding across the missing data.
+                this.bufferedUnits.length = 0
+                this.setupBufferNeedsKeyFrame = true
+                return
+            }
+            this.bufferedUnits.push(unit)
             return
         }
 
@@ -216,6 +227,9 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         }
         if (unit.type != "key" && this.needsKeyFrame) {
             return
+        }
+        if (unit.type == "key") {
+            this.setupBufferNeedsKeyFrame = false
         }
 
         if (this.translator) {
@@ -288,6 +302,10 @@ export class VideoDecoderPipe implements DataVideoRenderer {
 
     pollRequestIdr(): boolean {
         let requestIdr = false
+
+        if (this.setupBufferNeedsKeyFrame && !this.requestedIdr) {
+            requestIdr = true
+        }
 
         const estimatedQueueDelayMs = this.fps > 0
             ? this.decoder.decodeQueueSize * 1000 / this.fps

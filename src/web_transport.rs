@@ -15,7 +15,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{info, warn};
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
 
-const PROTOCOL_VERSION: u8 = 2;
+const PROTOCOL_VERSION: u8 = 3;
 const DRAFT02_REQUEST_HEADER: &str = "sec-webtransport-http3-draft02";
 const DRAFT02_RESPONSE_HEADER: &str = "sec-webtransport-http3-draft";
 const DRAFT02_RESPONSE_VALUE: &str = "draft02";
@@ -45,7 +45,7 @@ const MAX_PENDING_TOKENS: usize = 1_024;
 const CLIENT_LANE_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_RELIABLE_BODY_TIMEOUT: Duration = Duration::from_secs(2);
 const VIDEO_STREAM_OPEN_TIMEOUT: Duration = Duration::from_millis(500);
-const VIDEO_STREAM_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const VIDEO_STREAM_WRITE_INACTIVITY_TIMEOUT: Duration = Duration::from_millis(500);
 const VIDEO_STREAM_TIMEOUT_CODE: VarInt = VarInt::from_u32(0x100);
 
 // Quinn transmits locally buffered data from higher-priority streams first.
@@ -745,6 +745,7 @@ async fn run_connection_inner(
     let (video_tx, video_rx) = video_admission_channel();
     let (audio_tx, audio_rx) = watch::channel(None::<Bytes>);
     let (other_tx, other_rx) = mpsc::channel(OTHER_QUEUE_CAPACITY);
+    let datagram_state = Arc::new(Mutex::new(DatagramState::default()));
 
     bridge
         .state_tx
@@ -761,8 +762,8 @@ async fn run_connection_inner(
         result = write_video_streams(connection.clone(), video_rx, bridge.inbound_tx.clone()) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteVideo, error)),
         result = write_latest_lane(&mut audio_stream, audio_rx) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteAudio, error)),
         result = write_queue_lane(&mut other_stream, other_rx) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteReliableServer, error)),
-        result = read_reliable_inbound(&mut reliable_client_stream, bridge.inbound_tx.clone(), bridge.shutdown_rx.clone()) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::ReadReliableClient, error)),
-        result = read_datagrams(connection.clone(), bridge.inbound_tx.clone(), bridge.shutdown_rx.clone()) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::ReadDatagrams, error)),
+        result = read_reliable_inbound(&mut reliable_client_stream, bridge.inbound_tx.clone(), bridge.shutdown_rx.clone(), datagram_state.clone()) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::ReadReliableClient, error)),
+        result = read_datagrams(connection.clone(), bridge.inbound_tx.clone(), bridge.shutdown_rx.clone(), datagram_state) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::ReadDatagrams, error)),
         _ = bridge.shutdown_rx.changed() => Ok(()),
         error = connection.closed() => {
             info!(error = %error, "WebTransport peer connection closed");
@@ -826,11 +827,7 @@ async fn dispatch_outbound(
             TransportChannelId::HOST_VIDEO => {
                 let is_idr = frame.get(1) == Some(&1);
                 if drop_video_until_idr && !is_idr {
-                    if !idr_request_enqueued {
-                        idr_request_enqueued = inbound_tx
-                            .try_send(Bytes::from_static(&[TransportChannelId::HOST_VIDEO, 0]))
-                            .is_ok();
-                    }
+                    try_enqueue_video_recovery_request(&inbound_tx, &mut idr_request_enqueued);
                     continue;
                 }
 
@@ -866,11 +863,7 @@ async fn dispatch_outbound(
                             );
                         }
                         drop_video_until_idr = true;
-                        if !idr_request_enqueued {
-                            idr_request_enqueued = inbound_tx
-                                .try_send(Bytes::from_static(&[TransportChannelId::HOST_VIDEO, 0]))
-                                .is_ok();
-                        }
+                        try_enqueue_video_recovery_request(&inbound_tx, &mut idr_request_enqueued);
                     }
                     Err(VideoAdmissionError::Closed) => {
                         bail!("WebTransport video admission queue is closed");
@@ -893,6 +886,14 @@ async fn dispatch_outbound(
         }
     }
     Ok(())
+}
+
+fn try_enqueue_video_recovery_request(inbound_tx: &mpsc::Sender<Bytes>, enqueued: &mut bool) {
+    if !*enqueued {
+        *enqueued = inbound_tx
+            .try_send(Bytes::from_static(&[TransportChannelId::HOST_VIDEO, 0]))
+            .is_ok();
+    }
 }
 
 async fn write_latest_lane(
@@ -942,6 +943,12 @@ async fn write_video_streams(
         if let Some(frame) = pending_frame.take() {
             let is_idr = frame.get(1) == Some(&1);
             if recovering && !is_idr {
+                // The bounded inbound queue may have been full when the
+                // timeout was first observed. Every discarded delta is
+                // another opportunity to enqueue the recovery request; do
+                // not wait forever for an IDR the encoder was never asked to
+                // produce.
+                try_enqueue_video_recovery_request(&inbound_tx, &mut recovery_request_enqueued);
                 continue;
             }
             if frame.len() > MAX_VIDEO_IN_FLIGHT_BYTES
@@ -995,14 +1002,10 @@ async fn write_video_streams(
                                 );
                             }
                             recovering = true;
-                            if !recovery_request_enqueued {
-                                recovery_request_enqueued = inbound_tx
-                                    .try_send(Bytes::from_static(&[
-                                        TransportChannelId::HOST_VIDEO,
-                                        0,
-                                    ]))
-                                    .is_ok();
-                            }
+                            try_enqueue_video_recovery_request(
+                                &inbound_tx,
+                                &mut recovery_request_enqueued,
+                            );
                         }
                     }
                     Some(Err(error)) if error.is_cancelled() => {}
@@ -1063,20 +1066,38 @@ async fn write_video_stream_part(
     stream: &mut wtransport::SendStream,
     bytes: &[u8],
 ) -> Result<VideoStreamWriteOutcome> {
-    match tokio::time::timeout(VIDEO_STREAM_WRITE_TIMEOUT, stream.write_all(bytes)).await {
-        Ok(Ok(())) => Ok(VideoStreamWriteOutcome::Complete),
-        // A peer may stop an obsolete per-frame stream after it has already
-        // advanced to an IDR. That recovers only video and is not a connection
-        // failure; persistent audio/other lane failures remain fatal.
-        Ok(Err(wtransport::error::StreamWriteError::Stopped(_))) => {
-            Ok(VideoStreamWriteOutcome::Stopped)
-        }
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => {
-            let _ = stream.reset(VIDEO_STREAM_TIMEOUT_CODE);
-            Ok(VideoStreamWriteOutcome::TimedOut)
+    let mut written = 0;
+    while written < bytes.len() {
+        match tokio::time::timeout(
+            VIDEO_STREAM_WRITE_INACTIVITY_TIMEOUT,
+            stream.write(&bytes[written..]),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                let _ = stream.reset(VIDEO_STREAM_TIMEOUT_CODE);
+                return Ok(VideoStreamWriteOutcome::TimedOut);
+            }
+            Ok(Ok(progress)) => written += progress,
+            // A peer may stop an obsolete per-frame stream after it has
+            // already advanced to an IDR. That recovers only video and is not
+            // a connection failure; persistent audio/other lane failures
+            // remain fatal.
+            Ok(Err(wtransport::error::StreamWriteError::Stopped(_))) => {
+                return Ok(VideoStreamWriteOutcome::Stopped);
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                // This deadline resets after every successful partial write.
+                // Large IDRs can therefore take longer than 500 ms in total
+                // on a constrained flow-control window while a truly stuck
+                // stream is still reclaimed promptly.
+                let _ = stream.reset(VIDEO_STREAM_TIMEOUT_CODE);
+                return Ok(VideoStreamWriteOutcome::TimedOut);
+            }
         }
     }
+    Ok(VideoStreamWriteOutcome::Complete)
 }
 
 async fn write_queue_lane(
@@ -1100,13 +1121,40 @@ async fn read_reliable_inbound(
     stream: &mut wtransport::RecvStream,
     inbound_tx: mpsc::Sender<Bytes>,
     mut shutdown_rx: watch::Receiver<bool>,
+    datagram_state: Arc<Mutex<DatagramState>>,
 ) -> Result<()> {
     loop {
         let frame = tokio::select! {
             result = read_frame(stream) => result?,
             _ = shutdown_rx.changed() => return Ok(()),
         };
-        inbound_tx.send(frame).await?;
+        if is_snapshot_envelope(&frame) {
+            // Reserve capacity before advancing the shared sequence state.
+            // If this reliable snapshot was delayed behind a newer datagram,
+            // decoding it after the wait rejects it as stale. Conversely, the
+            // permit makes decode + delivery atomic with respect to datagram
+            // admission without holding a mutex across an await.
+            let permit = tokio::select! {
+                result = inbound_tx.reserve() => result?,
+                _ = shutdown_rx.changed() => return Ok(()),
+            };
+            let decoded = {
+                let mut state = datagram_state
+                    .lock()
+                    .map_err(|_| anyhow!("WebTransport datagram state lock is poisoned"))?;
+                state.decode(&frame)
+            };
+            if let Some(mut frames) = decoded
+                && frames.len() == 1
+            {
+                permit.send(frames.remove(0));
+            }
+        } else {
+            // Ordinary reliable frames retain their existing byte-for-byte,
+            // ordered channel semantics. Only the reserved snapshot envelope
+            // is interpreted by the transport.
+            inbound_tx.send(frame).await?;
+        }
     }
 }
 
@@ -1137,6 +1185,7 @@ fn encode_video_stream_header(sequence: u32, length: usize) -> Result<[u8; 9]> {
     Ok(header)
 }
 
+#[cfg(test)]
 fn decode_frame_length(encoded: [u8; 4]) -> Result<usize> {
     let length = u32::from_be_bytes(encoded) as usize;
     if length == 0 || length > MAX_FRAME_BYTES {
@@ -1157,8 +1206,8 @@ async fn read_datagrams(
     connection: Connection,
     inbound_tx: mpsc::Sender<Bytes>,
     mut shutdown_rx: watch::Receiver<bool>,
+    datagram_state: Arc<Mutex<DatagramState>>,
 ) -> Result<()> {
-    let mut state = DatagramState::default();
     loop {
         let datagram = tokio::select! {
             result = connection.receive_datagram() => result?,
@@ -1169,24 +1218,34 @@ async fn read_datagrams(
             continue;
         }
 
-        // Retain the previous cumulative baseline if the bounded input queue
-        // cannot accept the whole recovered delta. A later cumulative datagram
-        // can then recover it instead of silently losing motion.
-        let old_state = state.clone();
-        let Some(frames) = state.decode(bytes) else {
-            continue;
-        };
-        if frames.is_empty() {
-            continue;
-        }
-        let Ok(permits) = inbound_tx.try_reserve_many(frames.len()) else {
-            state = old_state;
-            continue;
-        };
-        for (permit, frame) in permits.zip(frames) {
-            permit.send(frame);
+        {
+            let mut state = datagram_state
+                .lock()
+                .map_err(|_| anyhow!("WebTransport datagram state lock is poisoned"))?;
+            // Retain the previous cumulative baseline if the bounded input
+            // queue cannot accept the whole recovered delta. A later
+            // cumulative datagram can then recover it instead of silently
+            // losing motion.
+            let old_state = state.clone();
+            let Some(frames) = state.decode(bytes) else {
+                continue;
+            };
+            if frames.is_empty() {
+                continue;
+            }
+            let Ok(permits) = inbound_tx.try_reserve_many(frames.len()) else {
+                *state = old_state;
+                continue;
+            };
+            for (permit, frame) in permits.zip(frames) {
+                permit.send(frame);
+            }
         }
     }
+}
+
+fn is_snapshot_envelope(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == DATAGRAM_MAGIC && bytes[1] == DATAGRAM_SNAPSHOT
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1511,7 +1570,7 @@ mod tests {
         let path = format!("/transport?v={PROTOCOL_VERSION}&token={encoded}");
         assert_eq!(
             endpoint.setup_url("setup-token"),
-            "https://example.test:443/transport?v=2&token=setup-token"
+            "https://example.test:443/transport?v=3&token=setup-token"
         );
         assert_eq!(
             endpoint.validate_request("example.test", &path),
@@ -1643,6 +1702,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_video_recovery_request_is_retried_after_capacity_returns() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        inbound_tx
+            .send(Bytes::from_static(&[TransportChannelId::GENERAL]))
+            .await
+            .unwrap();
+        let mut enqueued = false;
+
+        // This models the first timeout attempt racing a full input queue.
+        try_enqueue_video_recovery_request(&inbound_tx, &mut enqueued);
+        assert!(!enqueued);
+        assert_eq!(
+            inbound_rx.recv().await.as_deref(),
+            Some(&[TransportChannelId::GENERAL][..])
+        );
+
+        // A subsequent discarded delta retries instead of waiting forever
+        // for an IDR that was never requested.
+        try_enqueue_video_recovery_request(&inbound_tx, &mut enqueued);
+        assert!(enqueued);
+        assert_eq!(
+            inbound_rx.recv().await.as_deref(),
+            Some(&[TransportChannelId::HOST_VIDEO, 0][..])
+        );
+
+        // Once latched, later deltas do not create an IDR request storm.
+        try_enqueue_video_recovery_request(&inbound_tx, &mut enqueued);
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn short_video_burst_does_not_trigger_false_congestion_recovery() {
         let (outbound_tx, mut outbound_rx) = mpsc::channel(VIDEO_QUEUE_CAPACITY);
         let (video_tx, mut video_rx) = video_admission_channel();
@@ -1749,5 +1839,53 @@ mod tests {
         invalid.extend_from_slice(&11_u32.to_be_bytes());
         invalid.push(0xaa);
         assert!(state.decode(&invalid).is_none());
+    }
+
+    #[test]
+    fn reliable_snapshot_barrier_rejects_a_delayed_older_datagram() {
+        let packet = |sequence: u32, value: u8| {
+            let mut bytes = vec![
+                DATAGRAM_MAGIC,
+                DATAGRAM_SNAPSHOT,
+                TransportChannelId::MOUSE_ABSOLUTE,
+            ];
+            bytes.extend_from_slice(&7_u16.to_be_bytes());
+            bytes.extend_from_slice(&sequence.to_be_bytes());
+            bytes.push(value);
+            bytes
+        };
+        let mut shared_state = DatagramState::default();
+
+        // The reliable fallback uses the same envelope and advances the state
+        // shared with the datagram reader.
+        let reliable = packet(11, 0xbb);
+        assert!(is_snapshot_envelope(&reliable));
+        assert_eq!(
+            shared_state.decode(&reliable).unwrap()[0].as_ref(),
+            &[TransportChannelId::MOUSE_ABSOLUTE, 0xbb]
+        );
+
+        // An older datagram that was already in the network is ignored.
+        assert!(shared_state.decode(&packet(10, 0xaa)).is_none());
+        assert_eq!(
+            shared_state.decode(&packet(12, 0xcc)).unwrap()[0].as_ref(),
+            &[TransportChannelId::MOUSE_ABSOLUTE, 0xcc]
+        );
+
+        // The inverse arrival order is monotonic too: an earlier datagram can
+        // be delivered first, then the newer reliable snapshot supersedes it.
+        let mut datagram_first = DatagramState::default();
+        assert_eq!(
+            datagram_first.decode(&packet(10, 0xaa)).unwrap()[0].as_ref(),
+            &[TransportChannelId::MOUSE_ABSOLUTE, 0xaa]
+        );
+        assert_eq!(
+            datagram_first.decode(&reliable).unwrap()[0].as_ref(),
+            &[TransportChannelId::MOUSE_ABSOLUTE, 0xbb]
+        );
+        assert!(datagram_first.decode(&reliable).is_none());
+        assert!(!is_snapshot_envelope(
+            &[TransportChannelId::KEYBOARD, 0x01,]
+        ));
     }
 }
