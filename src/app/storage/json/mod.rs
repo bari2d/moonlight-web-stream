@@ -425,7 +425,7 @@ impl Storage for JsonStorage {
     }
     async fn remove_role(&self, role_id: RoleId) -> Result<(), AppError> {
         // Delete all users with that role
-        {
+        let users_to_remove = {
             let mut users = self.users.write().await;
 
             let mut users_to_remove = vec![];
@@ -440,9 +440,15 @@ impl Storage for JsonStorage {
             }
 
             // Remove all user id's in that list
-            for user_id in users_to_remove {
-                users.remove(&user_id);
+            for user_id in &users_to_remove {
+                users.remove(user_id);
             }
+
+            users_to_remove
+        };
+
+        for user_id in users_to_remove {
+            self.remove_all_user_session_tokens(UserId(user_id)).await?;
         }
 
         // Delete that role
@@ -590,16 +596,16 @@ impl Storage for JsonStorage {
     async fn remove_user(&self, user_id: UserId) -> Result<(), AppError> {
         let mut users = self.users.write().await;
 
-        let result = match users.remove(&user_id.0) {
-            None => Err(AppError::UserNotFound),
-            Some(_) => Ok(()),
-        };
+        if users.remove(&user_id.0).is_none() {
+            return Err(AppError::UserNotFound);
+        }
 
         drop(users);
 
+        self.remove_all_user_session_tokens(user_id).await?;
         self.force_write();
 
-        result
+        Ok(())
     }
     async fn list_users(&self) -> Result<Either<Vec<UserId>, Vec<StorageUser>>, AppError> {
         let users = self.users.read().await;
@@ -669,12 +675,22 @@ impl Storage for JsonStorage {
         &self,
         session: SessionToken,
     ) -> Result<(UserId, Option<StorageUser>), AppError> {
-        let sessions = self.sessions.read().await;
-
-        sessions
+        let user_id = self
+            .sessions
+            .read()
+            .await
             .get(&session)
-            .map(|session| (UserId(session.user_id), None))
-            .ok_or(AppError::SessionTokenNotFound)
+            .map(|session| UserId(session.user_id))
+            .ok_or(AppError::SessionTokenNotFound)?;
+
+        match self.get_user(user_id).await {
+            Ok(user) => Ok((user_id, Some(user))),
+            Err(AppError::UserNotFound) => {
+                self.remove_session_token(session).await?;
+                Err(AppError::SessionTokenNotFound)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn add_host(&self, host: StorageHostAdd) -> Result<StorageHost, AppError> {
@@ -797,5 +813,108 @@ impl Storage for JsonStorage {
         }
 
         Ok(user_hosts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_storage() -> JsonStorage {
+        let (store_sender, mut store_receiver) = mpsc::channel(1);
+        let session_expiration_checker =
+            spawn(async move { while store_receiver.recv().await.is_some() {} });
+
+        JsonStorage {
+            file: PathBuf::new(),
+            store_sender,
+            session_expiration_checker,
+            users: Default::default(),
+            hosts: Default::default(),
+            roles: Default::default(),
+            sessions: Default::default(),
+        }
+    }
+
+    async fn add_test_user(storage: &JsonStorage, role_id: RoleId) -> StorageUser {
+        storage
+            .add_user(StorageUserAdd {
+                role_id,
+                name: "test-user".to_string(),
+                password: None,
+                client_unique_id: "test-client".to_string(),
+            })
+            .await
+            .expect("test user should be created")
+    }
+
+    #[tokio::test]
+    async fn deleting_user_revokes_all_sessions() {
+        let storage = test_storage();
+        let user = add_test_user(&storage, RoleId(1)).await;
+        let first_session = storage
+            .create_session_token(user.id, Duration::from_secs(60))
+            .await
+            .expect("first session should be created");
+        let second_session = storage
+            .create_session_token(user.id, Duration::from_secs(60))
+            .await
+            .expect("second session should be created");
+
+        storage
+            .remove_user(user.id)
+            .await
+            .expect("user should be deleted");
+
+        for session in [first_session, second_session] {
+            assert!(matches!(
+                storage.get_user_by_session_token(session).await,
+                Err(AppError::SessionTokenNotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_session_is_rejected_and_removed() {
+        let storage = test_storage();
+        let session = storage
+            .create_session_token(UserId(42), Duration::from_secs(60))
+            .await
+            .expect("session should be created");
+
+        assert!(matches!(
+            storage.get_user_by_session_token(session).await,
+            Err(AppError::SessionTokenNotFound)
+        ));
+        assert!(!storage.sessions.read().await.contains_key(&session));
+    }
+
+    #[tokio::test]
+    async fn deleting_role_revokes_sessions_for_its_users() {
+        let storage = test_storage();
+        let role = storage
+            .add_role(StorageRoleAdd {
+                name: "test-role".to_string(),
+                ty: RoleType::User,
+                default_settings: StorageRoleDefaultSettings::default(),
+                permissions: StorageRolePermissions::default(),
+            })
+            .await
+            .expect("test role should be created");
+        let user = add_test_user(&storage, role.id).await;
+        let session = storage
+            .create_session_token(user.id, Duration::from_secs(60))
+            .await
+            .expect("session should be created");
+
+        storage
+            .remove_role(role.id)
+            .await
+            .expect("role should be deleted");
+
+        assert!(matches!(
+            storage.get_user_by_session_token(session).await,
+            Err(AppError::SessionTokenNotFound)
+        ));
     }
 }

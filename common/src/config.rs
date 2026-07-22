@@ -412,11 +412,13 @@ mod tests {
 
     #[test]
     fn partial_web_transport_config_keeps_field_defaults() {
+        let config: Config = serde_json::from_str(r#"{"web_transport":{"enabled":true}}"#)
+            .expect("partial WebTransport config should deserialize");
 
         assert!(config.web_transport.enabled);
         assert_eq!(
             config.web_transport.bind_address,
-            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+            "0.0.0.0:443"
                 .parse::<SocketAddr>()
                 .expect("default bind address should parse")
         );

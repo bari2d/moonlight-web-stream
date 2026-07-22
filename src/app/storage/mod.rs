@@ -189,6 +189,7 @@ pub trait Storage {
     /// The returned tuple can contain a StorageUser if the Storage thinks it's more efficient to query all data directly
     async fn get_user_by_name(&self, name: &str)
     -> Result<(UserId, Option<StorageUser>), AppError>;
+    /// Deletes a user and all of their session tokens.
     async fn remove_user(&self, user_id: UserId) -> Result<(), AppError>;
     /// The returned tuple can contain a Vec<UserId> or Vec<StorageUser> if the Storage thinks it's more efficient to query all data directly
     async fn list_users(&self) -> Result<Either<Vec<UserId>, Vec<StorageUser>>, AppError>;
@@ -201,7 +202,6 @@ pub trait Storage {
         expires_after: Duration,
     ) -> Result<SessionToken, AppError>;
     async fn remove_session_token(&self, session: SessionToken) -> Result<(), AppError>;
-    #[allow(dead_code)]
     async fn remove_all_user_session_tokens(&self, user_id: UserId) -> Result<(), AppError>;
     /// The returned tuple can contain a StorageUser if the Storage thinks it's more efficient to query all data directly
     async fn get_user_by_session_token(

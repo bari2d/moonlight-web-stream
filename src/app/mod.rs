@@ -337,17 +337,29 @@ impl App {
         &self,
         session: SessionToken,
     ) -> Result<AuthenticatedUser, AppError> {
-        let (user_id, user) = self
+        let (user_id, cached_user) = self
             .inner
             .storage
             .get_user_by_session_token(session)
             .await?;
 
+        let user = match cached_user {
+            Some(user) => user,
+            None => match self.inner.storage.get_user(user_id).await {
+                Ok(user) => user,
+                Err(AppError::UserNotFound) => {
+                    self.inner.storage.remove_session_token(session).await?;
+                    return Err(AppError::SessionTokenNotFound);
+                }
+                Err(err) => return Err(err),
+            },
+        };
+
         Ok(AuthenticatedUser {
             inner: User {
                 app: self.new_ref(),
                 id: user_id,
-                cache_storage: user.map(Into::into),
+                cache_storage: Some(user.into()),
             },
         })
     }

@@ -71,8 +71,8 @@ export class User implements Component {
         this.div.removeEventListener("ml-userclicked", listener as any)
     }
 
-    private onDelete() {
-        tryDeleteUser(this.api, this.user.id)
+    private async onDelete() {
+        await tryDeleteUser(this.api, this.user.id)
 
         this.div.dispatchEvent(new ComponentEvent("ml-userdeleted", this))
     }
