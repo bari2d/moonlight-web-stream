@@ -632,6 +632,11 @@ impl Storage for JsonStorage {
         user_id: UserId,
         expiration: Duration,
     ) -> Result<SessionToken, AppError> {
+        let users = self.users.read().await;
+        if !users.contains_key(&user_id.0) {
+            return Err(AppError::UserNotFound);
+        }
+
         let mut token;
         {
             let sessions = self.sessions.read().await;
@@ -877,10 +882,12 @@ mod tests {
     #[tokio::test]
     async fn stale_session_is_rejected_and_removed() {
         let storage = test_storage();
+        let user = add_test_user(&storage, RoleId(1)).await;
         let session = storage
-            .create_session_token(UserId(42), Duration::from_secs(60))
+            .create_session_token(user.id, Duration::from_secs(60))
             .await
             .expect("session should be created");
+        storage.users.write().await.remove(&user.id.0);
 
         assert!(matches!(
             storage.get_user_by_session_token(session).await,
