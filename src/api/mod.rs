@@ -10,7 +10,7 @@ use crate::api::{
     auth::auth_middleware,
     host::{delete_host, get_host, list_hosts, pair_host, patch_host, post_host, wake_host},
     role::{add_role, delete_role, get_role, list_roles, patch_role},
-    settings::{get_default_settings, get_permissions},
+    settings::{get_default_settings, get_permissions, get_user_settings, patch_user_settings},
     user::{add_user, delete_user, get_user, list_users, patch_user},
 };
 
@@ -68,7 +68,9 @@ pub fn api_service() -> impl HttpServiceFactory {
         .service(services![
             // -- Settings
             get_default_settings,
-            get_permissions
+            get_permissions,
+            get_user_settings,
+            patch_user_settings,
         ])
         .service(services![
             // -- Stream

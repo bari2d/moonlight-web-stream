@@ -15,6 +15,7 @@ use moonlight_common::{
     },
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::app::{
@@ -24,7 +25,8 @@ use crate::app::{
     password::StoragePassword,
     role::{Role, RoleId},
     storage::{
-        StorageHostAdd, StorageHostCache, StorageQueryHosts, StorageUser, StorageUserModify,
+        StorageHostAdd, StorageHostCache, StorageQueryHosts, StorageSettingsMutation, StorageUser,
+        StorageUserModify,
     },
 };
 
@@ -257,6 +259,41 @@ impl AuthenticatedUser {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn settings(&mut self) -> Result<(Option<Value>, u64), AppError> {
+        let user = self.storage_user().await?;
+
+        Ok((user.settings.clone(), user.settings_revision))
+    }
+
+    pub async fn patch_settings(
+        &mut self,
+        settings: Value,
+        mutation_id: String,
+    ) -> Result<StorageSettingsMutation, AppError> {
+        self.update_settings(Some(settings), mutation_id).await
+    }
+
+    pub async fn clear_settings(
+        &mut self,
+        mutation_id: String,
+    ) -> Result<StorageSettingsMutation, AppError> {
+        self.update_settings(None, mutation_id).await
+    }
+
+    async fn update_settings(
+        &mut self,
+        settings: Option<Value>,
+        mutation_id: String,
+    ) -> Result<StorageSettingsMutation, AppError> {
+        let app = self.app.access()?;
+
+        self.cache_storage = None;
+
+        app.storage
+            .modify_user_settings(self.id, settings, mutation_id)
+            .await
     }
 
     pub async fn new_session(&self, expiration: Duration) -> Result<SessionToken, AppError> {

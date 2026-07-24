@@ -26,7 +26,9 @@ const DOUBLE_TAP_FIRST_TAP_MAX_TIME_MS = 100
 const DOUBLE_TAP_SECOND_TAP_MAX_TIME_MS = 200
 
 const CONTROLLER_RUMBLE_INTERVAL_MS = 60
-const CONTROLLER_STATE_REFRESH_INTERVAL_MS = 250
+// Periodically resend the complete controller snapshot so a lost datagram
+// cannot leave a button or stick state stale for a noticeable quarter-second.
+const CONTROLLER_STATE_REFRESH_INTERVAL_MS = 50
 const I16_MIN = -I16_MAX - 1
 const MAX_RELATIVE_MOUSE_CHUNKS = 64
 const RELATIVE_MOUSE_FLUSH_INTERVAL_MS = 4
@@ -426,10 +428,15 @@ export class StreamInput {
     onPointerMove(event: PointerEvent, rect: DOMRect): number {
         const samples = this.getCoalescedPointerSamples(event)
         if (event.pointerType == "touch") {
-            for (const sample of samples) {
+            // A coalesced pointer event can contain several historical positions.
+            // Replaying all of them adds input latency when the main thread or
+            // network is busy. Keep only the freshest MOVE for each pointer;
+            // DOWN/UP/CANCEL continue to use their dedicated, reliable paths.
+            const newestSamples = this.getNewestPointerSamples(samples)
+            for (const sample of newestSamples) {
                 this.onTouchSamplesMove([this.touchSampleFromPointerEvent(sample)], rect)
             }
-            return samples.length
+            return newestSamples.length
         }
 
         const mouseMode = this.config.mouseMode
@@ -469,6 +476,18 @@ export class StreamInput {
         // The Pointer Events contract already returns coalesced samples in
         // chronological order. Avoid sorting/allocating on this hot path.
         return coalescedEvents.length > 0 ? coalescedEvents : [event]
+    }
+
+    private getNewestPointerSamples(samples: PointerEvent[]): PointerEvent[] {
+        if (samples.length <= 1) {
+            return samples
+        }
+
+        const newestByPointer = new Map<number, PointerEvent>()
+        for (const sample of samples) {
+            newestByPointer.set(sample.pointerId, sample)
+        }
+        return Array.from(newestByPointer.values())
     }
 
     private syncPointerMouseButtons(pointerId: number, buttons: number, clientX: number, clientY: number, rect: DOMRect) {

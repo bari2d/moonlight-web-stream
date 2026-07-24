@@ -296,14 +296,40 @@ pub struct UndetailedRole {
     pub name: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, TS)]
+fn default_adaptive_bitrate() -> bool {
+    true
+}
+
+fn default_minimum_bitrate_kbps() -> u32 {
+    2_000
+}
+
+fn default_encrypt_host_media() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Debug, TS, Clone)]
 #[ts(export, export_to = EXPORT_PATH)]
 pub struct StreamSettings {
     pub bitrate_kbps: u32,
+    #[serde(default = "default_adaptive_bitrate")]
+    pub adaptive_bitrate: bool,
+    #[serde(default = "default_minimum_bitrate_kbps")]
+    pub minimum_bitrate_kbps: u32,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub play_audio_local: bool,
+    /// Request encryption for the inner Moonlight video hop from Sunshine/Apollo
+    /// to the streamer. The host may force encryption regardless of this option.
+    /// WebTransport remains encrypted independently.
+    #[serde(default = "default_encrypt_host_media")]
+    pub encrypt_host_video: bool,
+    /// Request encryption for the inner Moonlight audio hop from Sunshine/Apollo
+    /// to the streamer. The host may force encryption regardless of this option.
+    /// WebTransport remains encrypted independently.
+    #[serde(default = "default_encrypt_host_media")]
+    pub encrypt_host_audio: bool,
     /// This is using the [VideoFormats]
     pub supported_codecs: u32,
     pub hdr: bool,
@@ -417,6 +443,7 @@ ts_consts!(
     pub const CONTROLLER14: u8 = 24;
     pub const CONTROLLER15: u8 = 25;
     pub const RTT: u8 = 26;
+    pub const STREAM_CONTROL: u8 = 27;
 );
 
 #[derive(Serialize, Deserialize, Debug, TS, Clone, Copy, PartialEq, Eq)]

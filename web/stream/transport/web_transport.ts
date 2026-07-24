@@ -20,33 +20,48 @@ const MAX_RELIABLE_QUEUED_FRAMES = 64
 const COMBINED_RELIABLE_WRITE_MAX_BYTES = 4 * 1024
 const MAX_MEDIA_FRAME_BYTES = 16 * 1024 * 1024
 const MAX_INCOMING_STREAM_TASKS = 16
+const MAX_VIDEO_FIN_DRAIN_TASKS = 8
+const MAX_QUEUED_VIDEO_FIN_DRAINS = 32
 const MAX_INCOMING_ALLOCATED_BYTES = 64 * 1024 * 1024
 const MAX_PENDING_VIDEO_FRAMES = 4
 const MAX_PENDING_VIDEO_BYTES = 32 * 1024 * 1024
 const MAX_VIDEO_SEQUENCE_GAP = 32
 const VIDEO_REORDER_DEADLINE_MS = 50
-const VIDEO_RECOVERY_RETRY_MS = 250
+const VIDEO_REORDER_HARD_DEADLINE_MS = 125
+const VIDEO_RECOVERY_INITIAL_RETRY_MS = 250
+const VIDEO_RECOVERY_MAX_RETRY_MS = 2000
+const VIDEO_RECOVERY_ENQUEUE_RETRY_MS = 25
 const CLOSE_DRAIN_TIMEOUT_MS = 250
-const PROTOCOL_VERSION = "3"
+const PROTOCOL_VERSION = "4"
 
 const LANE_VIDEO_FRAME = 1
 const LANE_AUDIO = 2
 const LANE_OTHER = 3
 const LANE_CLIENT_RELIABLE = 4
+// These are WebTransport application error codes. The server maps them into
+// HTTP/3's reserved application-error range before resetting a per-frame
+// video stream; the browser exposes the original value here.
+const VIDEO_STREAM_TIMEOUT_ERROR_CODE = 0x10
+const VIDEO_STREAM_SUPERSEDED_ERROR_CODE = 0x11
 const DATAGRAM_MAGIC = 0xf0
 const DATAGRAM_SNAPSHOT = 2
 const DATAGRAM_SNAPSHOT_HEADER_BYTES = 9
+const TOUCH_EVENT_MOVE = 1
+const TOUCH_POINTER_HEADER_BYTES = 5
+const TOUCH_MOVE_SNAPSHOT_PREFIX = "touch:"
 
 type Lifecycle = "new" | "connecting" | "connected" | "closing" | "closed" | "failed"
 type ChannelSender = (id: TransportChannelIdValue, message: ArrayBuffer) => void
 type BufferedBytesReader = () => number | null
+type ReliableSnapshotKey = number | string
 
 type ReliableFrame = {
     id: number
     payload: ArrayBuffer
     bufferedBytes: number
     enqueuedAt: number
-    snapshotId: TransportChannelIdValue | null
+    snapshotId: ReliableSnapshotKey | null
+    videoRecovery: boolean
 }
 
 type PendingDatagram = {
@@ -62,8 +77,13 @@ type PendingVideoFrame = {
     bufferedBytes: number
 }
 
+type PendingVideoFinDrain = {
+    reader: ReadableStreamDefaultReader<Uint8Array>
+    decoder: IncomingLaneDecoder
+}
+
 /**
- * WebTransport protocol v3.
+ * WebTransport protocol v4.
  *
  * Server video uses one independently resettable unidirectional stream per
  * frame: lane byte 1, u32-BE wrapping sequence, u32-BE frame length, then the
@@ -73,7 +93,8 @@ type PendingVideoFrame = {
  * so input barriers retain their ordering. Replaceable controller snapshots
  * use QUIC datagrams beginning with DATAGRAM_MAGIC when the browser exposes
  * them. Absolute mouse snapshots stay on lane 4 so they cannot overtake the
- * reliable position + click barrier used by point-and-drag input.
+ * reliable position + click barrier used by point-and-drag input. Stream
+ * control JSON uses STREAM_CONTROL on the same strict lane-3/lane-4 framing.
  */
 export class WebTransportTransport implements Transport {
     readonly implementationName = "web_transport"
@@ -89,14 +110,18 @@ export class WebTransportTransport implements Transport {
 
     private incomingStreamsReader: ReadableStreamDefaultReader<ReadableStream<Uint8Array>> | null = null
     private readonly incomingLaneReaders = new Set<ReadableStreamDefaultReader<Uint8Array>>()
+    private readonly incomingReaderCapacityWaiters: Array<() => void> = []
     private readonly activeVideoReaders = new Map<number, ReadableStreamDefaultReader<Uint8Array>>()
+    private readonly pendingVideoFinDrains: Array<PendingVideoFinDrain> = []
+    private activeVideoFinDrainTasks = 0
     private reliableWriter: WritableStreamDefaultWriter<Uint8Array> | null = null
     private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null
 
     private readonly reliableQueue: Array<ReliableFrame> = []
-    private readonly pendingReliableSnapshots = new Map<TransportChannelIdValue, ReliableFrame>()
+    private readonly pendingReliableSnapshots = new Map<ReliableSnapshotKey, ReliableFrame>()
     private reliableQueuedBytes = 0
     private reliableInFlightBytes = 0
+    private reliableInFlightVideoRecovery = false
     private reliablePumpRunning = false
 
     private incomingAllocatedBytes = 0
@@ -107,8 +132,14 @@ export class WebTransportTransport implements Transport {
     private videoLastDeliveredSequence: number | null = null
     private videoAwaitingIdr = true
     private videoIdrRequested = false
+    private videoRecoveryQueuedOrInFlight = false
+    private videoConsumerRecoveryNeeded = false
+    private videoOneShotRecoveryNeeded = false
+    private videoRecoveryRetryDelayMs = VIDEO_RECOVERY_INITIAL_RETRY_MS
     private videoReorderTimer: number | null = null
     private videoReorderExpectedSequence: number | null = null
+    private videoReorderHardTimer: number | null = null
+    private videoReorderHardExpectedSequence: number | null = null
     private videoRecoveryRetryTimer: number | null = null
 
     // Each key contains only the newest cumulative value or snapshot. No old
@@ -122,6 +153,7 @@ export class WebTransportTransport implements Transport {
     private reliableBytesSent = 0
     private reliableQueueOverflows = 0
     private reliableSnapshotsReplaced = 0
+    private reliableSnapshotsDiscarded = 0
     private reliableMotionCoalesced = 0
     private maxReliableQueueAgeMs = 0
     private datagramsSent = 0
@@ -137,6 +169,7 @@ export class WebTransportTransport implements Transport {
     private videoFramesDropped = 0
     private videoFramesReordered = 0
     private videoReorderTimeouts = 0
+    private videoReorderHardTimeouts = 0
     private videoRecoveryRequests = 0
     private maxReliableQueuedBytes = 0
     private closeNotified = false
@@ -304,6 +337,24 @@ export class WebTransportTransport implements Transport {
             return
         }
 
+        if (this.isVideoRecoveryPacket(id, message)) {
+            // Decoder-originated recovery uses the same deduplicated retry
+            // path as transport loss recovery. Never silently drop it merely
+            // because the reliable input queue is temporarily full.
+            this.videoConsumerRecoveryNeeded = true
+            this.requestVideoRecovery()
+            return
+        }
+
+        const touchMoveSnapshotKey = this.touchMoveSnapshotKey(id, message)
+        if (touchMoveSnapshotKey != null) {
+            // Native touch MOVE packets describe replaceable pointer state.
+            // DOWN/UP/CANCEL continue through the ordinary reliable path below
+            // so they remain strict barriers and clear every replacement key.
+            this.queueReliable(id, message, touchMoveSnapshotKey)
+            return
+        }
+
         if (id == TransportChannelId.MOUSE_ABSOLUTE) {
             const sequence = ((this.snapshotSequences.get(id) ?? 0) + 1) >>> 0
             this.snapshotSequences.set(id, sequence)
@@ -443,19 +494,22 @@ export class WebTransportTransport implements Transport {
     private queueReliable(
         id: number,
         payload: ArrayBuffer,
-        replaceableSnapshotId: TransportChannelIdValue | null = null,
-    ): void {
+        replaceableSnapshotId: ReliableSnapshotKey | null = null,
+    ): boolean {
         const bufferedBytes = 5 + payload.byteLength
+        const isVideoRecovery = this.isVideoRecoveryPacket(id, payload)
         if (payload.byteLength + 1 > MAX_RELIABLE_FRAME_BYTES) {
             this.reliableQueueOverflows++
             this.fail(new Error("WebTransport reliable frame exceeded its bound"), this.lifecycle == "connected" ? "failed" : "failednoconnect")
-            return
+            return false
         }
 
         if (replaceableSnapshotId == null) {
-            // Never replace a snapshot across a reliable key/button/control
-            // barrier. A later snapshot starts a fresh replaceable segment.
-            this.pendingReliableSnapshots.clear()
+            if (!isVideoRecovery) {
+                // Never replace a snapshot across a reliable key/button/control
+                // barrier. A later snapshot starts a fresh replaceable segment.
+                this.pendingReliableSnapshots.clear()
+            }
 
             // Mouse motion and high-resolution scroll are additive. Merge
             // only adjacent packets, so key/button/control messages remain
@@ -469,7 +523,7 @@ export class WebTransportTransport implements Transport {
                 previous.payload = combinedMotion
                 previous.bufferedBytes = 5 + combinedMotion.byteLength
                 this.reliableMotionCoalesced++
-                return
+                return true
             }
         } else {
             const pending = this.pendingReliableSnapshots.get(replaceableSnapshotId)
@@ -478,24 +532,33 @@ export class WebTransportTransport implements Transport {
                 if (nextQueuedBytes + this.reliableInFlightBytes > MAX_RELIABLE_QUEUED_BYTES) {
                     this.reliableQueueOverflows++
                     this.fail(new Error("WebTransport reliable queue exceeded its bound"), this.lifecycle == "connected" ? "failed" : "failednoconnect")
-                    return
+                    return false
                 }
                 pending.payload = payload
                 pending.bufferedBytes = bufferedBytes
                 this.reliableQueuedBytes = nextQueuedBytes
                 this.maxReliableQueuedBytes = Math.max(this.maxReliableQueuedBytes, this.reliableQueuedBytes)
                 this.reliableSnapshotsReplaced++
-                return
+                return true
             }
         }
 
-        if (
-            this.reliableQueue.length >= MAX_RELIABLE_QUEUED_FRAMES ||
-            this.reliableQueuedBytes + this.reliableInFlightBytes + bufferedBytes > MAX_RELIABLE_QUEUED_BYTES
-        ) {
+        if (isVideoRecovery) {
+            // Recovery is independent of input ordering. Reclaim only the
+            // newest, still-replaceable snapshots; anything separated by a
+            // button/key/control barrier is deliberately left untouched.
+            this.makeReliableRoomForRecovery(bufferedBytes)
+        }
+
+        if (!this.reliableFrameFits(bufferedBytes)) {
             this.reliableQueueOverflows++
+            if (isVideoRecovery) {
+                // A full input queue is not a transport failure. The recovery
+                // timer will retry once the reliable writer frees capacity.
+                return false
+            }
             this.fail(new Error("WebTransport reliable queue exceeded its bound"), this.lifecycle == "connected" ? "failed" : "failednoconnect")
-            return
+            return false
         }
 
         const frame = {
@@ -504,10 +567,11 @@ export class WebTransportTransport implements Transport {
             bufferedBytes,
             enqueuedAt: performance.now(),
             snapshotId: replaceableSnapshotId,
+            videoRecovery: isVideoRecovery,
         }
         // Decoder recovery must not wait behind a backlog of user input. It is
         // independent of input ordering and is idempotently latched upstream.
-        if (id == TransportChannelId.HOST_VIDEO) {
+        if (isVideoRecovery) {
             this.reliableQueue.unshift(frame)
         } else {
             this.reliableQueue.push(frame)
@@ -518,6 +582,59 @@ export class WebTransportTransport implements Transport {
         this.reliableQueuedBytes += bufferedBytes
         this.maxReliableQueuedBytes = Math.max(this.maxReliableQueuedBytes, this.reliableQueuedBytes)
         void this.pumpReliable()
+        return true
+    }
+
+    private isVideoRecoveryPacket(id: number, payload: ArrayBuffer): boolean {
+        return (
+            id == TransportChannelId.HOST_VIDEO &&
+            payload.byteLength == 1 &&
+            new Uint8Array(payload, 0, 1)[0] == 0
+        )
+    }
+
+    private touchMoveSnapshotKey(id: number, payload: ArrayBuffer): ReliableSnapshotKey | null {
+        if (
+            id != TransportChannelId.TOUCH ||
+            payload.byteLength < TOUCH_POINTER_HEADER_BYTES ||
+            new Uint8Array(payload, 0, 1)[0] != TOUCH_EVENT_MOVE
+        ) {
+            return null
+        }
+        const pointerId = new DataView(payload).getUint32(1, false)
+        return `${TOUCH_MOVE_SNAPSHOT_PREFIX}${pointerId}`
+    }
+
+    private reliableFrameFits(bufferedBytes: number): boolean {
+        return (
+            this.reliableQueue.length < MAX_RELIABLE_QUEUED_FRAMES &&
+            this.reliableQueuedBytes + this.reliableInFlightBytes + bufferedBytes <= MAX_RELIABLE_QUEUED_BYTES
+        )
+    }
+
+    private makeReliableRoomForRecovery(bufferedBytes: number): void {
+        while (!this.reliableFrameFits(bufferedBytes)) {
+            const index = this.reliableQueue.findIndex(frame => (
+                frame.snapshotId != null &&
+                this.pendingReliableSnapshots.get(frame.snapshotId) == frame
+            ))
+            if (index == -1) {
+                return
+            }
+
+            const [discarded] = this.reliableQueue.splice(index, 1)
+            if (!discarded) {
+                return
+            }
+            this.reliableQueuedBytes = Math.max(0, this.reliableQueuedBytes - discarded.bufferedBytes)
+            if (
+                discarded.snapshotId != null &&
+                this.pendingReliableSnapshots.get(discarded.snapshotId) == discarded
+            ) {
+                this.pendingReliableSnapshots.delete(discarded.snapshotId)
+            }
+            this.reliableSnapshotsDiscarded++
+        }
     }
 
     private combineAdjacentMouseMotion(
@@ -580,6 +697,7 @@ export class WebTransportTransport implements Transport {
                 }
                 this.reliableQueuedBytes -= frame.bufferedBytes
                 this.reliableInFlightBytes = frame.bufferedBytes
+                this.reliableInFlightVideoRecovery = frame.videoRecovery
                 this.maxReliableQueueAgeMs = Math.max(
                     this.maxReliableQueueAgeMs,
                     performance.now() - frame.enqueuedAt,
@@ -608,9 +726,14 @@ export class WebTransportTransport implements Transport {
                 this.reliableFramesSent++
                 this.reliableBytesSent += frame.bufferedBytes
                 this.reliableInFlightBytes = 0
+                if (frame.videoRecovery) {
+                    this.onVideoRecoveryWritten()
+                }
+                this.reliableInFlightVideoRecovery = false
             }
         } catch (error) {
             this.reliableInFlightBytes = 0
+            this.reliableInFlightVideoRecovery = false
             if (this.lifecycle == "connected") {
                 this.fail(error, "failed")
             }
@@ -629,21 +752,25 @@ export class WebTransportTransport implements Transport {
         }
         try {
             while (this.lifecycle == "connected") {
+                while (
+                    this.lifecycle == "connected" &&
+                    this.incomingLaneReaders.size >= MAX_INCOMING_STREAM_TASKS
+                ) {
+                    // Wait before accepting an arbitrary stream. Accepting one
+                    // and then awaiting it inline can let a stalled delta lane
+                    // hide a later IDR behind it.
+                    this.incomingStreamBackpressureEvents++
+                    await this.waitForIncomingReaderCapacity()
+                }
+                if (this.lifecycle != "connected") {
+                    break
+                }
                 const result = await reader.read()
                 if (this.lifecycle != "connected") {
                     break
                 }
                 if (result.done) {
                     break
-                }
-                if (this.incomingLaneReaders.size >= MAX_INCOMING_STREAM_TASKS) {
-                    // Apply natural stream backpressure instead of issuing
-                    // STOP_SENDING, which can race the peer's FIN and used to
-                    // tear down an otherwise healthy WebTransport session.
-                    this.incomingStreamBackpressureEvents++
-                    this.incomingStreams++
-                    await this.consumeIncomingLane(result.value)
-                    continue
                 }
                 this.incomingStreams++
                 void this.consumeIncomingLane(result.value)
@@ -658,6 +785,7 @@ export class WebTransportTransport implements Transport {
     private async consumeIncomingLane(stream: ReadableStream<Uint8Array>): Promise<void> {
         const reader = stream.getReader()
         this.incomingLaneReaders.add(reader)
+        let transferredToFinDrain = false
         const decoder = new IncomingLaneDecoder(
             (id, payload) => this.dispatchIncoming(id, payload),
             (sequence, id, payload) => this.receiveVideoFrame(sequence, id, payload),
@@ -684,18 +812,42 @@ export class WebTransportTransport implements Transport {
                     }
                     this.activeVideoReaders.set(sequence, reader)
                 }
+                if (decoder.lane == LANE_VIDEO_FRAME && decoder.videoPayloadComplete) {
+                    // Payload length, not FIN arrival, determines when a frame
+                    // is usable. Move the reader to a bounded FIN-drain pool so
+                    // delayed acknowledgements cannot consume all 16 payload
+                    // admission slots. Never cancel the receive side here.
+                    if (this.handoffVideoFinDrain(reader, decoder)) {
+                        transferredToFinDrain = true
+                        return
+                    }
+                }
             }
         } catch (error) {
+            const videoPayloadComplete = decoder.lane == LANE_VIDEO_FRAME && decoder.videoPayloadComplete
             if (this.lifecycle == "connected") {
                 this.incomingStreamErrors++
             }
             decoder.abort()
-            if (
+            const preambleVideoReset = (
+                decoder.lane == null &&
+                isServerVideoStreamReset(error)
+            )
+            const recoverableVideoLoss = (
                 this.lifecycle == "connected" &&
-                decoder.lane == LANE_VIDEO_FRAME &&
-                !(error instanceof WireProtocolError) &&
+                (
+                    preambleVideoReset ||
+                    (
+                        decoder.lane == LANE_VIDEO_FRAME &&
+                        (
+                            error instanceof TruncatedVideoFrameError ||
+                            !(error instanceof WireProtocolError)
+                        )
+                    )
+                ) &&
                 !decoder.videoFrameComplete
-            ) {
+            )
+            if (recoverableVideoLoss) {
                 this.handleVideoStreamFailure(decoder.videoSequence)
             } else if (this.lifecycle == "connected") {
                 if (error instanceof WireProtocolError) {
@@ -704,15 +856,147 @@ export class WebTransportTransport implements Transport {
                     this.fail(error, "failed")
                 }
             }
-        } finally {
-            this.incomingLaneReaders.delete(reader)
-            const sequence = decoder.videoSequence
-            if (sequence != null && this.activeVideoReaders.get(sequence) == reader) {
-                this.activeVideoReaders.delete(sequence)
+            if (this.lifecycle == "connected" && videoPayloadComplete) {
+                // A downstream callback can fail after the wire payload is
+                // complete. Recovery still needs the receive side drained to
+                // FIN; releasing the lock here could let browser cleanup send
+                // STOP_SENDING and revive the old final-size race.
+                if (this.handoffVideoFinDrain(reader, decoder)) {
+                    transferredToFinDrain = true
+                    return
+                }
+                transferredToFinDrain = true
+                await this.drainVideoFin({ reader, decoder })
             }
-            try {
-                reader.releaseLock()
-            } catch (_error) { }
+        } finally {
+            if (!transferredToFinDrain) {
+                this.releaseIncomingLaneReader(reader, decoder)
+            }
+        }
+    }
+
+    private queueVideoFinDrain(
+        reader: ReadableStreamDefaultReader<Uint8Array>,
+        decoder: IncomingLaneDecoder,
+    ): boolean {
+        if (this.pendingVideoFinDrains.length >= MAX_QUEUED_VIDEO_FIN_DRAINS) {
+            return false
+        }
+        this.pendingVideoFinDrains.push({ reader, decoder })
+        this.pumpVideoFinDrains()
+        return true
+    }
+
+    private handoffVideoFinDrain(
+        reader: ReadableStreamDefaultReader<Uint8Array>,
+        decoder: IncomingLaneDecoder,
+    ): boolean {
+        this.releaseIncomingAdmission(reader)
+        if (this.queueVideoFinDrain(reader, decoder)) {
+            return true
+        }
+
+        // If the separate drain pool is already saturated, keep this reader
+        // in the admission set and drain it in place. This applies natural
+        // backpressure without an unbounded number of detached reads.
+        this.incomingLaneReaders.add(reader)
+        this.incomingStreamBackpressureEvents++
+        return false
+    }
+
+    private pumpVideoFinDrains(): void {
+        while (
+            this.activeVideoFinDrainTasks < MAX_VIDEO_FIN_DRAIN_TASKS &&
+            this.pendingVideoFinDrains.length > 0
+        ) {
+            const drain = this.pendingVideoFinDrains.shift()
+            if (!drain) {
+                return
+            }
+            this.activeVideoFinDrainTasks++
+            void this.runVideoFinDrain(drain)
+        }
+    }
+
+    private async runVideoFinDrain(drain: PendingVideoFinDrain): Promise<void> {
+        try {
+            await this.drainVideoFin(drain)
+        } finally {
+            this.activeVideoFinDrainTasks--
+            this.pumpVideoFinDrains()
+        }
+    }
+
+    private async drainVideoFin(drain: PendingVideoFinDrain): Promise<void> {
+        const { reader, decoder } = drain
+        try {
+            while (this.lifecycle == "connected") {
+                const result = await reader.read()
+                if (this.lifecycle != "connected") {
+                    decoder.abort()
+                    break
+                }
+                if (result.done) {
+                    decoder.finish()
+                    break
+                }
+                // A completed video payload may only be followed by FIN. The
+                // decoder rejects any trailing bytes while still allowing an
+                // empty chunk from implementations that surface one.
+                decoder.push(result.value)
+            }
+        } catch (error) {
+            if (this.lifecycle == "connected") {
+                this.incomingStreamErrors++
+            }
+            decoder.abort()
+            if (this.lifecycle == "connected" && error instanceof WireProtocolError) {
+                this.fail(error, "failed")
+            }
+        } finally {
+            this.releaseIncomingLaneReader(reader, decoder)
+        }
+    }
+
+    private releaseIncomingLaneReader(
+        reader: ReadableStreamDefaultReader<Uint8Array>,
+        decoder: IncomingLaneDecoder,
+    ): void {
+        this.releaseIncomingAdmission(reader)
+        const sequence = decoder.videoSequence
+        if (sequence != null && this.activeVideoReaders.get(sequence) == reader) {
+            this.activeVideoReaders.delete(sequence)
+        }
+        try {
+            reader.releaseLock()
+        } catch (_error) { }
+    }
+
+    private waitForIncomingReaderCapacity(): Promise<void> {
+        if (this.incomingLaneReaders.size < MAX_INCOMING_STREAM_TASKS) {
+            return Promise.resolve()
+        }
+        return new Promise(resolve => this.incomingReaderCapacityWaiters.push(resolve))
+    }
+
+    private releaseIncomingAdmission(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+        if (!this.incomingLaneReaders.delete(reader)) {
+            return
+        }
+        const waiter = this.incomingReaderCapacityWaiters.shift()
+        waiter?.()
+    }
+
+    private releaseIncomingCapacityWaiters(): void {
+        for (const waiter of this.incomingReaderCapacityWaiters.splice(0)) {
+            waiter()
+        }
+    }
+
+    private clearQueuedVideoFinDrains(): void {
+        for (const drain of this.pendingVideoFinDrains.splice(0)) {
+            drain.decoder.abort()
+            this.releaseIncomingLaneReader(drain.reader, drain.decoder)
         }
     }
 
@@ -787,9 +1071,10 @@ export class WebTransportTransport implements Transport {
         // FIN/retransmission and violate QUIC final-size invariants.
         this.discardPendingVideoFramesNotNewerThan(sequence)
         this.clearVideoReorderTimer()
-        this.clearVideoRecoveryRetryTimer()
         this.videoAwaitingIdr = false
-        this.videoIdrRequested = false
+        this.videoConsumerRecoveryNeeded = false
+        this.videoOneShotRecoveryNeeded = false
+        this.resetVideoRecoveryRetry()
         this.deliverVideoFrame(sequence, id, payload)
         this.flushPendingVideoFrames()
     }
@@ -837,9 +1122,18 @@ export class WebTransportTransport implements Transport {
     }
 
     private deliverVideoFrame(sequence: number, id: number, payload: ArrayBuffer): void {
+        try {
+            this.dispatchIncoming(id, payload)
+        } catch (error) {
+            // A frame is not committed merely because its bytes arrived. If a
+            // decoder/pipeline listener rejects it, its dependent deltas are
+            // unsafe and recovery must begin from a fresh IDR.
+            this.videoFramesDropped++
+            this.enterVideoRecovery()
+            throw error
+        }
         this.videoLastDeliveredSequence = sequence
         this.videoExpectedSequence = (sequence + 1) >>> 0
-        this.dispatchIncoming(id, payload)
     }
 
     private flushPendingVideoFrames(): void {
@@ -855,6 +1149,13 @@ export class WebTransportTransport implements Transport {
         }
         if (this.pendingVideoFrames.size == 0) {
             this.clearVideoReorderTimer()
+            if (
+                !this.videoAwaitingIdr &&
+                !this.videoConsumerRecoveryNeeded &&
+                !this.videoOneShotRecoveryNeeded
+            ) {
+                this.resetVideoRecoveryRetry()
+            }
         } else {
             this.scheduleVideoReorderDeadline()
         }
@@ -868,6 +1169,7 @@ export class WebTransportTransport implements Transport {
                 // Earlier streams can still form a decodable prefix. Ask for
                 // an IDR now, but do not withhold that useful prefix merely
                 // because a future independent stream failed first.
+                this.videoOneShotRecoveryNeeded = true
                 this.requestVideoRecovery()
             }
             return
@@ -887,6 +1189,9 @@ export class WebTransportTransport implements Transport {
         if (this.videoReorderTimer != null && this.videoReorderExpectedSequence == expected) {
             return
         }
+        if (this.videoReorderHardTimer != null && this.videoReorderHardExpectedSequence == expected) {
+            return
+        }
         this.clearVideoReorderTimer()
         this.videoReorderExpectedSequence = expected
         this.videoReorderTimer = window.setTimeout(() => {
@@ -901,34 +1206,128 @@ export class WebTransportTransport implements Transport {
                 // an IDR while still allowing the missing delta to arrive.
                 this.videoReorderTimeouts++
                 this.requestVideoRecovery()
+                this.scheduleVideoReorderHardDeadline(expected)
             }
         }, VIDEO_REORDER_DEADLINE_MS)
     }
 
+    private scheduleVideoReorderHardDeadline(expected: number): void {
+        if (this.videoReorderHardTimer != null) {
+            window.clearTimeout(this.videoReorderHardTimer)
+        }
+        this.videoReorderHardExpectedSequence = expected
+        this.videoReorderHardTimer = window.setTimeout(() => {
+            this.videoReorderHardTimer = null
+            this.videoReorderHardExpectedSequence = null
+            if (
+                this.lifecycle == "connected" &&
+                this.pendingVideoFrames.size > 0 &&
+                this.videoExpectedSequence == expected
+            ) {
+                // Once the soft recovery request has had time to arrive, do
+                // not replay a stale mini-GOP. Deltas that depend on the lost
+                // frame are unusable; discard them and await the requested IDR.
+                this.videoReorderHardTimeouts++
+                this.enterVideoRecovery()
+            }
+        }, VIDEO_REORDER_HARD_DEADLINE_MS)
+    }
+
     private enterVideoRecovery(): void {
         this.clearVideoReorderTimer()
+        this.discardPendingVideoFrames()
         this.videoAwaitingIdr = true
         this.requestVideoRecovery()
     }
 
     private requestVideoRecovery(): void {
-        if (this.videoIdrRequested || this.lifecycle != "connected") {
+        if (
+            this.videoIdrRequested ||
+            this.videoRecoveryQueuedOrInFlight ||
+            this.lifecycle != "connected"
+        ) {
             return
         }
-        this.videoIdrRequested = true
-        this.videoRecoveryRequests++
-        this.queueReliable(TransportChannelId.HOST_VIDEO, new Uint8Array([0]).buffer)
         this.clearVideoRecoveryRetryTimer()
+        const queued = this.queueReliable(TransportChannelId.HOST_VIDEO, new Uint8Array([0]).buffer)
+        if (!queued) {
+            this.videoRecoveryRetryTimer = window.setTimeout(() => {
+                this.videoRecoveryRetryTimer = null
+                if (this.videoRecoveryStillNeeded()) {
+                    this.requestVideoRecovery()
+                } else {
+                    this.videoRecoveryRetryDelayMs = VIDEO_RECOVERY_INITIAL_RETRY_MS
+                }
+            }, VIDEO_RECOVERY_ENQUEUE_RETRY_MS)
+            return
+        }
+
+        // Keep exactly one recovery request queued or in flight. The response
+        // timer starts only after the writer accepts it, so writer backpressure
+        // cannot accumulate duplicate HOST_VIDEO frames at the queue head.
+        this.videoRecoveryQueuedOrInFlight = true
+        this.videoRecoveryRequests++
+    }
+
+    private onVideoRecoveryWritten(): void {
+        this.videoRecoveryQueuedOrInFlight = false
+        // A future-stream failure asks for one IDR without discarding a useful
+        // earlier prefix. Once that request is written, only stronger recovery
+        // states should keep retrying it.
+        this.videoOneShotRecoveryNeeded = false
+        if (this.lifecycle != "connected" || !this.videoRecoveryStillNeeded()) {
+            this.videoIdrRequested = false
+            this.videoRecoveryRetryDelayMs = VIDEO_RECOVERY_INITIAL_RETRY_MS
+            this.clearVideoRecoveryRetryTimer()
+            return
+        }
+
+        this.videoIdrRequested = true
+        this.clearVideoRecoveryRetryTimer()
+        const retryDelayMs = this.videoRecoveryRetryDelayMs
+        this.videoRecoveryRetryDelayMs = Math.min(
+            VIDEO_RECOVERY_MAX_RETRY_MS,
+            retryDelayMs * 2,
+        )
         this.videoRecoveryRetryTimer = window.setTimeout(() => {
             this.videoRecoveryRetryTimer = null
             if (this.lifecycle != "connected" || !this.videoIdrRequested) {
                 return
             }
             this.videoIdrRequested = false
-            if (this.videoAwaitingIdr || this.pendingVideoFrames.size > 0) {
+            if (this.videoRecoveryStillNeeded()) {
                 this.requestVideoRecovery()
+            } else {
+                this.videoRecoveryRetryDelayMs = VIDEO_RECOVERY_INITIAL_RETRY_MS
             }
-        }, VIDEO_RECOVERY_RETRY_MS)
+        }, retryDelayMs)
+    }
+
+    private videoRecoveryStillNeeded(): boolean {
+        return (
+            this.videoConsumerRecoveryNeeded ||
+            this.videoOneShotRecoveryNeeded ||
+            this.videoAwaitingIdr ||
+            this.pendingVideoFrames.size > 0
+        )
+    }
+
+    private resetVideoRecoveryRetry(): void {
+        this.clearVideoRecoveryRetryTimer()
+        this.videoIdrRequested = false
+        this.videoRecoveryRetryDelayMs = VIDEO_RECOVERY_INITIAL_RETRY_MS
+
+        for (let index = this.reliableQueue.length - 1; index >= 0; index--) {
+            const frame = this.reliableQueue[index]
+            if (!frame.videoRecovery) {
+                continue
+            }
+            this.reliableQueue.splice(index, 1)
+            this.reliableQueuedBytes = Math.max(0, this.reliableQueuedBytes - frame.bufferedBytes)
+        }
+        if (!this.reliableInFlightVideoRecovery) {
+            this.videoRecoveryQueuedOrInFlight = false
+        }
     }
 
     private clearVideoReorderTimer(): void {
@@ -937,6 +1336,11 @@ export class WebTransportTransport implements Transport {
             this.videoReorderTimer = null
         }
         this.videoReorderExpectedSequence = null
+        if (this.videoReorderHardTimer != null) {
+            window.clearTimeout(this.videoReorderHardTimer)
+            this.videoReorderHardTimer = null
+        }
+        this.videoReorderHardExpectedSequence = null
     }
 
     private clearVideoRecoveryRetryTimer(): void {
@@ -949,6 +1353,17 @@ export class WebTransportTransport implements Transport {
     private clearPendingVideoFrames(): void {
         this.clearVideoReorderTimer()
         this.clearVideoRecoveryRetryTimer()
+        this.videoIdrRequested = false
+        this.videoRecoveryQueuedOrInFlight = false
+        this.videoConsumerRecoveryNeeded = false
+        this.videoOneShotRecoveryNeeded = false
+        this.videoRecoveryRetryDelayMs = VIDEO_RECOVERY_INITIAL_RETRY_MS
+        this.pendingVideoFrames.clear()
+        this.pendingVideoBytes = 0
+    }
+
+    private discardPendingVideoFrames(): void {
+        this.videoFramesDropped += this.pendingVideoFrames.size
         this.pendingVideoFrames.clear()
         this.pendingVideoBytes = 0
     }
@@ -1010,10 +1425,10 @@ export class WebTransportTransport implements Transport {
         }
         this.lifecycle = "failed"
         this.logger?.debug(`WebTransport failed: ${error instanceof Error ? error.message : String(error)}`)
-        this.clearQueues()
         try {
             this.transport?.close({ closeCode: 1, reason: closeReason })
         } catch (_closeError) { }
+        this.clearQueues()
         this.notifyClose(shutdown)
     }
 
@@ -1033,25 +1448,40 @@ export class WebTransportTransport implements Transport {
     }
 
     private clearQueues(): void {
+        this.releaseIncomingCapacityWaiters()
+        this.clearQueuedVideoFinDrains()
+        // Active reads retain their own lock until the pending read settles,
+        // but no sequence bookkeeping should retain them after shutdown.
+        this.incomingLaneReaders.clear()
+        this.activeVideoReaders.clear()
         this.reliableQueue.length = 0
         this.pendingReliableSnapshots.clear()
         this.reliableQueuedBytes = 0
         this.reliableInFlightBytes = 0
+        this.reliableInFlightVideoRecovery = false
         this.pendingDatagrams.clear()
         this.clearPendingVideoFrames()
     }
 
+    failStreamControl(error: unknown): void {
+        this.fail(
+            error,
+            this.lifecycle == "connected" ? "failed" : "failednoconnect",
+            "invalid stream control",
+        )
+    }
+
     async close(): Promise<void> {
-        if (this.lifecycle == "closed" || this.lifecycle == "closing") {
+        if (this.lifecycle == "closed" || this.lifecycle == "closing" || this.lifecycle == "failed") {
             return
         }
         this.lifecycle = "closing"
-        this.clearQueues()
 
         const closed = this.transport?.closed.catch(() => undefined)
         try {
             this.transport?.close({ closeCode: 0, reason: "client closed" })
         } catch (_error) { }
+        this.clearQueues()
         if (closed) {
             await Promise.race([
                 closed,
@@ -1075,6 +1505,7 @@ export class WebTransportTransport implements Transport {
             webTransportReliableBytesSent: this.reliableBytesSent,
             webTransportReliableQueueOverflows: this.reliableQueueOverflows,
             webTransportReliableSnapshotsReplaced: this.reliableSnapshotsReplaced,
+            webTransportReliableSnapshotsDiscarded: this.reliableSnapshotsDiscarded,
             webTransportReliableMotionCoalesced: this.reliableMotionCoalesced,
             webTransportReliableOldestQueuedAgeMs: this.reliableQueue.length > 0
                 ? performance.now() - this.reliableQueue[0].enqueuedAt
@@ -1092,6 +1523,8 @@ export class WebTransportTransport implements Transport {
             webTransportIncomingBytes: this.incomingBytes,
             webTransportIncomingStreamErrors: this.incomingStreamErrors,
             webTransportIncomingStreamBackpressureEvents: this.incomingStreamBackpressureEvents,
+            webTransportVideoFinDrainsActive: this.activeVideoFinDrainTasks,
+            webTransportVideoFinDrainsQueued: this.pendingVideoFinDrains.length,
             webTransportIncomingAllocatedBytes: this.incomingAllocatedBytes,
             webTransportIncomingMaxAllocatedBytes: this.maxIncomingAllocatedBytes,
             webTransportVideoPendingFrames: this.pendingVideoFrames.size,
@@ -1100,7 +1533,10 @@ export class WebTransportTransport implements Transport {
             webTransportVideoFramesDropped: this.videoFramesDropped,
             webTransportVideoFramesReordered: this.videoFramesReordered,
             webTransportVideoReorderTimeouts: this.videoReorderTimeouts,
+            webTransportVideoReorderHardTimeouts: this.videoReorderHardTimeouts,
             webTransportVideoRecoveryRequests: this.videoRecoveryRequests,
+            webTransportVideoRecoveryRetryDelayMs: this.videoRecoveryRetryDelayMs,
+            webTransportVideoRecoveryQueuedOrInFlight: this.videoRecoveryQueuedOrInFlight ? "true" : "false",
             webTransportVideoAwaitingIdr: this.videoAwaitingIdr ? "true" : "false",
         }
     }
@@ -1146,6 +1582,25 @@ class WebTransportDataTransportChannel implements DataTransportChannel {
 }
 
 class WireProtocolError extends Error { }
+class TruncatedVideoFrameError extends WireProtocolError { }
+
+function isServerVideoStreamReset(error: unknown): boolean {
+    if (typeof error != "object" || error == null) {
+        return false
+    }
+
+    const candidate = error as {
+        source?: unknown
+        streamErrorCode?: unknown
+    }
+    return (
+        candidate.source == "stream" &&
+        (
+            candidate.streamErrorCode == VIDEO_STREAM_TIMEOUT_ERROR_CODE ||
+            candidate.streamErrorCode == VIDEO_STREAM_SUPERSEDED_ERROR_CODE
+        )
+    )
+}
 
 class IncomingLaneDecoder {
     private laneValue: number | null = null
@@ -1158,6 +1613,7 @@ class IncomingLaneDecoder {
     private payloadUsed = 0
     private channelId: number | null = null
     private reservedBytes = 0
+    private videoWirePayloadComplete = false
     private videoFrameDispatched = false
 
     constructor(
@@ -1179,6 +1635,10 @@ class IncomingLaneDecoder {
         return this.videoFrameDispatched
     }
 
+    get videoPayloadComplete(): boolean {
+        return this.videoWirePayloadComplete
+    }
+
     push(chunk: Uint8Array): void {
         let offset = 0
         if (this.laneValue == null) {
@@ -1197,7 +1657,7 @@ class IncomingLaneDecoder {
         }
 
         while (offset < chunk.byteLength) {
-            if (this.videoFrameDispatched) {
+            if (this.videoWirePayloadComplete) {
                 throw new WireProtocolError("WebTransport video stream contains trailing data")
             }
 
@@ -1269,9 +1729,13 @@ class IncomingLaneDecoder {
                     // Payload length is authoritative. Dispatch immediately
                     // and merely drain/validate FIN afterward so a delayed or
                     // retransmitted FIN cannot hold a complete video frame.
-                    this.videoFrameDispatched = true
+                    this.videoWirePayloadComplete = true
                     this.releasePayloadReservation()
                     this.onVideoFrame(this.sequenceValue, channelId, payload.buffer as ArrayBuffer)
+                    // Do not mark the frame complete until every downstream
+                    // listener accepted it. A thrown decode/presentation error
+                    // must flow back into keyframe recovery.
+                    this.videoFrameDispatched = true
                 } else {
                     this.releasePayloadReservation()
                     this.onFrame(channelId, payload.buffer as ArrayBuffer)
@@ -1281,18 +1745,24 @@ class IncomingLaneDecoder {
     }
 
     finish(): void {
+        if (this.laneValue == LANE_VIDEO_FRAME) {
+            if (
+                this.sequenceBytesUsed != 4 ||
+                this.sequenceValue == null ||
+                this.lengthBytesUsed != 0 ||
+                this.payload != null ||
+                !this.videoWirePayloadComplete
+            ) {
+                throw new TruncatedVideoFrameError("WebTransport video stream ended with an incomplete frame")
+            }
+            return
+        }
         if (
             this.laneValue == null ||
             this.lengthBytesUsed != 0 ||
-            this.payload != null ||
-            (this.laneValue == LANE_VIDEO_FRAME && this.sequenceBytesUsed != 4)
+            this.payload != null
         ) {
             throw new WireProtocolError("WebTransport incoming lane ended with an incomplete frame")
-        }
-        if (this.laneValue == LANE_VIDEO_FRAME) {
-            if (this.sequenceValue == null || !this.videoFrameDispatched) {
-                throw new WireProtocolError("WebTransport video stream ended without exactly one frame")
-            }
         }
     }
 

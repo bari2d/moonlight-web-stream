@@ -257,6 +257,25 @@ There are a few important things to be aware of when using WebSockets for stream
     ```
   - The decoder will be detected and used automatically.
 
+### Adaptive bitrate and media encryption
+
+Adaptive bitrate is enabled by default for the low-latency WebTransport and
+WebSocket browser paths. Moonlight Web uses sustained congestion, loss,
+recovery, and queue-pressure signals to reduce the source bitrate while keeping
+the browser session connected. The default floor is 2,000 Kbps and can be
+changed in **Network / Performance**.
+Because Apollo cannot change encoder bitrate live, a reduction briefly restarts
+the audio/video connection without closing the game.
+
+WebTransport is always protected by TLS 1.3 and that encryption cannot be
+disabled. The advanced **Request Host Video Encryption** and **Request Host
+Audio Encryption** options request additional Moonlight media encryption
+between Sunshine/Apollo and the local streamer. They are enabled by default,
+but are best-effort because the host must support them; a host may also require
+the inner encryption. Disabling them can save a small amount of CPU and packet
+overhead when that local hop is trusted, but does not fix browser-facing WAN
+distance, packet loss, or congestion.
+
 ## Config
 The config file is under `server/config.json` relative to the executable.
 Here are the most important settings for configuring Moonlight Web.

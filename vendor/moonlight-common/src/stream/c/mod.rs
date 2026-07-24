@@ -116,7 +116,11 @@ impl MoonlightInstance {
 
 pub struct MoonlightStream {
     server_version: ServerVersion,
-    handle: Arc<Handle>,
+    // Owning this handle means this value is responsible for stopping the
+    // process-global C connection. Taking it before cleanup makes both
+    // `stop()` and `Drop` one-shot, even though `stop()` consumes `self` and
+    // therefore runs `Drop` afterwards.
+    handle: Option<Arc<Handle>>,
 }
 
 fn to_c_char_array(bytes: [u8; 16]) -> [c_char; 16] {
@@ -124,6 +128,10 @@ fn to_c_char_array(bytes: [u8; 16]) -> [c_char; 16] {
 }
 
 impl MoonlightStream {
+    fn take_cleanup_handle(&mut self) -> Option<Arc<Handle>> {
+        self.handle.take()
+    }
+
     pub(crate) fn start(
         handle: Arc<Handle>,
         stream_config: MoonlightStreamConfig,
@@ -134,18 +142,6 @@ impl MoonlightStream {
         audio_decoder: impl AudioDecoder + Send + 'static,
     ) -> Result<Self, MoonlightError> {
         unsafe {
-            let mut connection_guard = handle
-                .connection_exists
-                .lock()
-                .expect("connection lock poisoned");
-            if *connection_guard {
-                return Err(MoonlightError::ConnectionAlreadyExists);
-            }
-
-            *connection_guard = true;
-
-            drop(connection_guard);
-
             let server_version = stream_config.version;
 
             let address = CString::from_str(&stream_config.address)?;
@@ -156,6 +152,19 @@ impl MoonlightStream {
                 .rtsp_session_url
                 .map(CString::new)
                 .transpose()?;
+
+            // Do every fallible conversion before claiming the process-global
+            // connection. Otherwise an invalid string could return early and
+            // leave the singleton permanently marked as active.
+            let mut connection_guard = handle
+                .connection_exists
+                .lock()
+                .expect("connection lock poisoned");
+            if *connection_guard {
+                return Err(MoonlightError::ConnectionAlreadyExists);
+            }
+            *connection_guard = true;
+            drop(connection_guard);
 
             // See: https://github.com/moonlight-stream/moonlight-common-c/blob/62687809b1f7410c3db4be2527503a54ae408d70/src/Limelight.h#L524-L539
             let mut server_info_raw = _SERVER_INFORMATION {
@@ -191,8 +200,8 @@ impl MoonlightStream {
             };
 
             // If something panics this will be dropped -> connection_guard is false again
-            let this = Self {
-                handle,
+            let mut this = Self {
+                handle: Some(handle),
                 server_version,
             };
 
@@ -220,6 +229,13 @@ impl MoonlightStream {
             );
 
             if result != 0 {
+                // A failed native start may still leave process-global state
+                // behind. Clean it synchronously so an immediate adaptive
+                // bitrate rollback cannot race Drop's asynchronous fallback
+                // and observe ConnectionAlreadyExists.
+                if let Some(handle) = this.take_cleanup_handle() {
+                    Self::stop_handle(handle);
+                }
                 return Err(MoonlightError::ConnectionFailed);
             }
 
@@ -230,7 +246,10 @@ impl MoonlightStream {
     // For internal use only as it's possible for this connection to be cancelled
     // and then the next connection setting connection_exists to true
     fn is_connected(&self) -> bool {
-        let result = self.handle.connection_exists.lock();
+        let Some(handle) = &self.handle else {
+            return false;
+        };
+        let result = handle.connection_exists.lock();
 
         result.map(|x| *x).unwrap_or(false)
     }
@@ -744,15 +763,31 @@ impl MoonlightStream {
     /// Will stop the stream.
     ///
     /// This will block until the stream is fully stopped.
-    pub fn stop(self) {
+    pub fn stop(mut self) {
+        let Some(handle) = self.take_cleanup_handle() else {
+            return;
+        };
+
+        Self::stop_handle(handle);
+    }
+
+    fn stop_handle(handle: Arc<Handle>) {
         unsafe {
             // # Safety
-            // LiStopConnection is not thread safe so we need a mutex
-            let mut connection_guard = self
-                .handle
+            // LiStopConnection is process-global and not thread safe, so the
+            // singleton handle's mutex serializes it with every start/stop.
+            let mut connection_guard = handle
                 .connection_exists
                 .lock()
                 .expect("connection lock poisoned");
+
+            // A stream can reach here after native startup failed, explicit
+            // shutdown already completed, or another cleanup path won the
+            // race. Only the owner of the active global connection may call
+            // into the C cleanup API.
+            if !*connection_guard {
+                return;
+            }
 
             LiStopConnection();
 
@@ -770,13 +805,32 @@ impl MoonlightStream {
 
 impl Drop for MoonlightStream {
     fn drop(&mut self) {
-        let this = MoonlightStream {
-            server_version: self.server_version,
-            handle: self.handle.clone(),
+        let Some(handle) = self.take_cleanup_handle() else {
+            // Explicit stop already claimed and completed cleanup.
+            return;
         };
 
         spawn(move || {
-            this.stop();
+            MoonlightStream::stop_handle(handle);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_ownership_can_only_be_taken_once() {
+        let handle = Arc::new(Handle {
+            connection_exists: Mutex::new(false),
+        });
+        let mut stream = MoonlightStream {
+            server_version: ServerVersion::new(0, 0, 0, -1),
+            handle: Some(handle),
+        };
+
+        assert!(stream.take_cleanup_handle().is_some());
+        assert!(stream.take_cleanup_handle().is_none());
     }
 }

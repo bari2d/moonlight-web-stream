@@ -16,6 +16,7 @@ use crate::{StreamConnection, transport::OutboundPacket};
 
 pub(crate) struct StreamVideoDecoder {
     pub(crate) stream: Weak<StreamConnection>,
+    pub(crate) generation: u64,
     pub(crate) supported_formats: VideoFormats,
     pub(crate) stats: VideoStats,
 }
@@ -26,14 +27,24 @@ impl VideoDecoder for StreamVideoDecoder {
             warn!("Failed to setup video because stream is deallocated");
             return -1;
         };
-
-        {
-            let mut stream_info = stream.stream_setup.blocking_lock();
-            stream_info.video = Some(setup);
+        if !stream.is_current_native_generation(self.generation) {
+            return 0;
         }
 
         {
+            let mut stream_info = stream.stream_setup.blocking_lock();
+            if !stream.is_current_native_generation(self.generation) {
+                return 0;
+            }
+            stream_info.video = Some(setup);
+        }
+
+        let generation = self.generation;
+        {
             stream.runtime.clone().block_on(async move {
+                if !stream.is_current_native_generation(generation) {
+                    return 0;
+                }
                 let sender = {
                     let sender = stream.transport_sender.lock().await;
                     sender.clone()
@@ -57,6 +68,15 @@ impl VideoDecoder for StreamVideoDecoder {
             warn!("Failed to send video decode unit because stream is deallocated");
             return DecodeResult::Ok;
         };
+        if !stream.is_current_native_generation(self.generation) {
+            return DecodeResult::Ok;
+        }
+        if !stream.is_native_media_ready(self.generation) {
+            // Do not forward a new-generation IDR before ConnectionComplete.
+            // The browser requests one fresh IDR after every decoder setup, so
+            // requesting here would race setup and could waste that keyframe.
+            return DecodeResult::Ok;
+        }
 
         let sender = {
             let sender = stream.transport_sender.blocking_lock();
@@ -65,7 +85,11 @@ impl VideoDecoder for StreamVideoDecoder {
 
         let start = Instant::now();
 
+        let generation = self.generation;
         let result = stream.runtime.block_on(async {
+            if !stream.is_native_media_ready(generation) {
+                return DecodeResult::Ok;
+            }
             if let Some(sender) = sender.as_ref() {
                 match sender.send_video_unit(unit.as_ref()).await {
                     Err(err) => {
@@ -82,7 +106,10 @@ impl VideoDecoder for StreamVideoDecoder {
         });
 
         let frame_processing_time = Instant::now() - start;
-        self.stats.analyze(&stream, &unit, frame_processing_time);
+        if stream.is_current_native_generation(generation) {
+            self.stats
+                .analyze(&stream, generation, &unit, frame_processing_time);
+        }
 
         result
     }
@@ -137,6 +164,7 @@ impl VideoStats {
     fn analyze(
         &mut self,
         stream: &Arc<StreamConnection>,
+        generation: u64,
         unit: &VideoDecodeUnit<&[u8]>,
         frame_processing_time: Duration,
     ) {
@@ -185,6 +213,9 @@ impl VideoStats {
 
             let stream = stream.clone();
             runtime.spawn(async move {
+                if !stream.is_current_native_generation(generation) {
+                    return;
+                }
                 stream
                     .try_send_packet(
                         OutboundPacket::Stats(StreamerStatsUpdate::Video {
@@ -218,6 +249,9 @@ impl VideoStats {
 
                 // Send RTT info
                 let ml_stream_lock = stream.stream.read().await;
+                if !stream.is_current_native_generation(generation) {
+                    return;
+                }
                 if let Some(ml_stream) = ml_stream_lock.as_ref() {
                     let rtt = ml_stream.estimated_rtt_info();
                     drop(ml_stream_lock);

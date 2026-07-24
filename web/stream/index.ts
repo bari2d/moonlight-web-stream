@@ -10,7 +10,7 @@ import { defaultStreamInputConfig, StreamInput } from "./input.js"
 import { Logger, LogMessageInfo } from "./log.js"
 import { gatherPipeInfo } from "./pipeline/index.js"
 import { StreamStats } from "./stats.js"
-import { Transport, TransportShutdown } from "./transport/index.js"
+import { DataTransportChannel, Transport, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebTransportTransport } from "./transport/web_transport.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
@@ -90,7 +90,22 @@ function isFirefox(): boolean {
 
 const WEBRTC_CONNECT_TIMEOUT_MS = 15000
 const WEBTRANSPORT_CONNECT_TIMEOUT_MS = 3000
-const FALLBACK_RECONNECT_DELAY_MS = 500
+const WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT = 2
+const WEBTRANSPORT_STABILITY_RESET_MS = 30000
+const WEBTRANSPORT_REPROBE_COOLDOWN_MS = 30000
+const CONTROL_SOCKET_CLOSE_TIMEOUT_MS = 1000
+const MAX_STREAM_CONTROL_JSON_BYTES = 64 * 1024
+const STREAM_SERVER_CONTROL_KEYS = new Set([
+    "Setup",
+    "WebRtc",
+    "WebTransportSetup",
+    "UpdateApp",
+    "DebugLog",
+    "ConnectionComplete",
+    "ConnectionTerminated",
+])
+
+type WebTransportReprobeState = "idle" | "pending" | "probing" | "spent"
 
 export class Stream implements Component {
     private logger: Logger = new Logger()
@@ -107,9 +122,31 @@ export class Stream implements Component {
     private eventTarget = new EventTarget()
 
     private ws: WebSocket
+    private controlGeneration = 0
+    private controlSocketGeneration = 0
+    private startConnectionTask: { generation: number, promise: Promise<void> } | null = null
+    private controlRestartTask: Promise<void> | null = null
+    private readonly retiringControlSockets = new WeakSet<WebSocket>()
+    private controlRecoveryGeneration: number | null = null
+    private stopping = false
     private iceServers: Array<RTCIceServer> | null = null
     private webTransportUrl: string | null = null
     private transportOverride: TransportType | null = null
+    private webTransportEstablishedRetryCount = 0
+    private webTransportStabilityTimer: number | null = null
+    private webTransportStabilityTransport: WebTransportTransport | null = null
+    private webTransportReprobeTimer: number | null = null
+    private webTransportReprobeTransport: WebSocketTransport | null = null
+    private webTransportReprobeDeadline: number | null = null
+    private webTransportReprobeState: WebTransportReprobeState = "idle"
+    private webTransportControl: {
+        transport: WebTransportTransport,
+        channel: DataTransportChannel,
+        generation: number,
+        listener: (data: ArrayBuffer) => void,
+    } | null = null
+    private readonly streamControlEncoder = new TextEncoder()
+    private readonly streamControlDecoder = new TextDecoder("utf-8", { fatal: true })
 
     private videoRenderer: VideoRenderer | null = null
     private audioPlayer: AudioPlayer | null = null
@@ -119,6 +156,8 @@ export class Stream implements Component {
 
     private streamerSize: [number, number]
     private hasConnectionComplete = false
+    private connectionCompleteEpoch = 0
+    private connectionCompleteSetup: Promise<void> = Promise.resolve()
     private hasVideoReady = false
     private hasDispatchedVideoReady = false
 
@@ -137,8 +176,8 @@ export class Stream implements Component {
 
         this.streamerSize = getStreamerSize(settings, viewerScreenSize)
 
-        this.ws = this.createControlWebSocket()
-        this.sendInitMessage()
+        this.ws = this.createControlWebSocket(this.controlGeneration)
+        this.sendInitMessage(this.controlGeneration)
 
         // Stream Input
         const streamInputConfig = defaultStreamInputConfig()
@@ -165,12 +204,16 @@ export class Stream implements Component {
         }
     }
     private resetVideoReadyState() {
+        this.connectionCompleteEpoch++
         this.hasConnectionComplete = false
         this.hasVideoReady = false
         this.hasDispatchedVideoReady = false
     }
     private markConnectionComplete() {
         this.hasConnectionComplete = true
+        if (this.transport instanceof WebSocketTransport) {
+            this.armWebTransportReprobeAfterWebSocketStability(this.transport, this.controlGeneration)
+        }
         this.tryDispatchVideoReady()
     }
     private markVideoReady() {
@@ -189,7 +232,15 @@ export class Stream implements Component {
         this.eventTarget.dispatchEvent(event)
     }
 
-    private async onMessage(message: StreamServerMessage) {
+    private isCurrentControlGeneration(generation: number): boolean {
+        return !this.stopping && this.controlGeneration == generation
+    }
+
+    private async onMessage(message: StreamServerMessage, generation: number) {
+        if (!this.isCurrentControlGeneration(generation)) {
+            return
+        }
+
         if ("DebugLog" in message) {
             const debugLog = message.DebugLog
 
@@ -203,6 +254,10 @@ export class Stream implements Component {
 
             this.eventTarget.dispatchEvent(event)
         } else if ("ConnectionComplete" in message) {
+            // Adaptive bitrate replaces only the native Moonlight connection,
+            // so the browser transport stays up and can receive another
+            // ConnectionComplete for the same Stream instance.
+            const completionEpoch = this.connectionCompleteEpoch
             const capabilities = message.ConnectionComplete.capabilities
             const formatRaw = message.ConnectionComplete.format
             const width = message.ConnectionComplete.width
@@ -246,23 +301,54 @@ export class Stream implements Component {
             if (!this.videoRenderer || !this.audioPlayer) {
                 throw "Video renderer or audio player not initialized!"
             }
+            const videoRenderer = this.videoRenderer
+            const audioPlayer = this.audioPlayer
 
-            await Promise.all([
-                this.videoRenderer.setup({
-                    codec: format,
-                    fps,
-                    width,
-                    height,
-                }),
-                this.audioPlayer.setup({
-                    sampleRate: audioSampleRate,
-                    channels: audioChannelCount,
-                    streams: audioStreams,
-                    coupledStreams: audioCoupledStreams,
-                    samplesPerFrame: audioSamplesPerFrame,
-                    mapping: audioMapping,
-                })
-            ])
+            // WebSocket message callbacks are not awaited by the browser. Keep
+            // repeated native-connection setups in receipt order so a slow TV
+            // cannot finish the initial probe after a reconnect setup and reset
+            // the decoder a second time behind the recovery IDR.
+            const setupResult = this.connectionCompleteSetup.then(async () => {
+                if (!this.isCurrentControlGeneration(generation)) {
+                    return
+                }
+                await Promise.all([
+                    videoRenderer.setup({
+                        codec: format,
+                        fps,
+                        width,
+                        height,
+                    }),
+                    audioPlayer.setup({
+                        sampleRate: audioSampleRate,
+                        channels: audioChannelCount,
+                        streams: audioStreams,
+                        coupledStreams: audioCoupledStreams,
+                        samplesPerFrame: audioSamplesPerFrame,
+                        mapping: audioMapping,
+                    })
+                ])
+            })
+            this.connectionCompleteSetup = setupResult.catch(() => { })
+            await setupResult
+            if (
+                !this.isCurrentControlGeneration(generation) ||
+                this.connectionCompleteEpoch != completionEpoch
+            ) {
+                // A transport fallback replaced this connection while its
+                // decoder setup was pending. Never let the stale completion
+                // mark the fresh transport ready or request on its channel.
+                return
+            }
+
+            // setup() resets the data decoder. On both initial startup and a
+            // replacement connection, the host's startup IDR may pass through
+            // while setup is still pending. Request one after every completed
+            // setup through WebTransport's deduplicated, retrying recovery path.
+            const video = this.transport?.getChannel(TransportChannelId.HOST_VIDEO)
+            if (video?.type == "data") {
+                this.requestHostVideoIdr(video)
+            }
 
             this.markConnectionComplete()
         } else if ("ConnectionTerminated" in message) {
@@ -286,7 +372,7 @@ export class Stream implements Component {
                 iceServers.map(server => server.urls).reduce((list, url) => list.concat(url), [])
             )}`)
 
-            await this.startConnection()
+            await this.startConnection(generation)
         }
         // -- WebRTC
         else if ("WebRtc" in message) {
@@ -299,34 +385,93 @@ export class Stream implements Component {
         }
     }
 
-    async startConnection() {
+    async startConnection(generation = this.controlGeneration): Promise<void> {
+        if (!this.isCurrentControlGeneration(generation)) {
+            return
+        }
+
+        const active = this.startConnectionTask
+        if (active) {
+            try {
+                await active.promise
+            } catch (error) {
+                if (active.generation == generation) {
+                    throw error
+                }
+            }
+            if (active.generation == generation || !this.isCurrentControlGeneration(generation)) {
+                return
+            }
+            return this.startConnection(generation)
+        }
+
+        const promise = this.runStartConnection(generation)
+        this.startConnectionTask = { generation, promise }
+        try {
+            await promise
+        } finally {
+            if (this.startConnectionTask?.promise == promise) {
+                this.startConnectionTask = null
+            }
+        }
+    }
+
+    private async runStartConnection(generation: number): Promise<void> {
+        if (!this.isCurrentControlGeneration(generation)) {
+            return
+        }
         this.debugLog(`Permissions: ${JSON.stringify(this.permissions)}`)
 
         const desiredTransport = this.transportOverride ?? this.settings.dataTransport
         this.debugLog(`Using transport: ${desiredTransport}`)
 
         if (desiredTransport == "auto") {
-            const shutdownReason = await this.tryWebTransport()
+            const shutdownReason = await this.tryWebTransport(generation)
 
-            if (shutdownReason == "failednoconnect" || shutdownReason == "failed" || shutdownReason == "disconnect") {
-                this.debugLog("WebTransport is unavailable or disconnected. Falling back to WebSocket transport.", { type: "ifErrorDescription" })
-                await this.restartWithFreshTransportFallback("websocket")
+            if (!this.isCurrentControlGeneration(generation)) {
                 return
             }
+
+            if (shutdownReason == "failednoconnect" && this.webTransportEstablishedRetryCount == 0) {
+                this.debugLog(
+                    `Initial WebTransport connection was unavailable. Falling back immediately to WebSocket transport; established-session retry budget remains 0/${WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT}.`,
+                    { type: "ifErrorDescription" },
+                )
+                await this.restartWithFreshTransportFallback("websocket", generation)
+                return
+            }
+            await this.retryWebTransportOrFallback(shutdownReason, generation)
+            return
         } else if (desiredTransport == "webtransport") {
-            const shutdownReason = await this.tryWebTransport()
-            if (shutdownReason == "failed" || shutdownReason == "disconnect") {
-                this.debugLog("WebTransport disconnected. Falling back to WebSocket transport.", { type: "ifErrorDescription" })
-                await this.restartWithFreshTransportFallback("websocket")
+            const shutdownReason = await this.tryWebTransport(generation)
+            if (!this.isCurrentControlGeneration(generation)) {
+                return
+            }
+            if (
+                shutdownReason == "failednoconnect" ||
+                shutdownReason == "failed" ||
+                shutdownReason == "disconnect"
+            ) {
+                await this.retryWebTransportOrFallback(shutdownReason, generation)
                 return
             }
         } else if (desiredTransport == "webrtc") {
-            await this.tryWebRTCTransport()
+            await this.tryWebRTCTransport(generation)
+            if (!this.isCurrentControlGeneration(generation)) {
+                return
+            }
         } else if (desiredTransport == "websocket") {
-            const shutdownReason = await this.tryWebSocketTransport()
-            if (shutdownReason == "failed") {
-                this.debugLog("WebSocket transport failed. Reconnecting with a fresh control socket.", { type: "ifErrorDescription" })
-                await this.restartWithFreshTransportFallback("websocket")
+            const shutdownReason = await this.tryWebSocketTransport(generation)
+            if (!this.isCurrentControlGeneration(generation)) {
+                return
+            }
+            if (shutdownReason == "failed" || shutdownReason == "disconnect") {
+                const reconnectTransport = this.selectWebSocketReconnectTransport()
+                this.debugLog(
+                    `WebSocket transport ${shutdownReason == "failed" ? "failed" : "disconnected"}. Reconnecting with a fresh control socket using ${reconnectTransport}.`,
+                    { type: "ifErrorDescription" },
+                )
+                await this.restartWithFreshTransportFallback(reconnectTransport, generation)
                 return
             }
         }
@@ -336,38 +481,52 @@ export class Stream implements Component {
 
     private transport: Transport | null = null
 
-    private createControlWebSocket(): WebSocket {
+    private isCurrentControlSocket(ws: WebSocket, generation: number): boolean {
+        return (
+            this.isCurrentControlGeneration(generation) &&
+            this.controlSocketGeneration == generation &&
+            this.ws === ws
+        )
+    }
+
+    private createControlWebSocket(generation: number): WebSocket {
         const wsApiHost = this.api.host_url.replace(/^http(s)?:/, "ws$1:")
         const ws = new WebSocket(`${wsApiHost}/host/stream`)
 
         ws.addEventListener("error", (event) => {
-            if (this.ws !== ws) {
+            if (!this.isCurrentControlSocket(ws, generation)) {
+                return
+            }
+            if (this.hasActiveWebTransportControl(generation)) {
                 return
             }
             this.onError(event)
         })
         ws.addEventListener("open", () => {
-            if (this.ws !== ws) {
+            if (!this.isCurrentControlSocket(ws, generation)) {
                 return
             }
-            this.onWsOpen()
+            this.onWsOpen(ws, generation)
         })
-        ws.addEventListener("close", () => {
-            if (this.ws !== ws) {
+        ws.addEventListener("close", (event) => {
+            if (this.retiringControlSockets.delete(ws)) {
                 return
             }
-            this.onWsClose()
+            if (!this.isCurrentControlSocket(ws, generation)) {
+                return
+            }
+            this.onWsClose(ws, generation, event)
         })
         ws.addEventListener("message", (event) => {
-            if (this.ws !== ws) {
+            if (!this.isCurrentControlSocket(ws, generation)) {
                 return
             }
-            this.onRawWsMessage(event)
+            this.onRawWsMessage(event, generation)
         })
 
         return ws
     }
-    private sendInitMessage() {
+    private sendInitMessage(generation: number) {
         this.sendWsMessage({
             Init: {
                 host_id: this.hostId,
@@ -375,37 +534,279 @@ export class Stream implements Component {
                 video_frame_queue_size: this.settings.videoFrameQueueSize,
                 audio_sample_queue_size: this.settings.audioSampleQueueSize,
             }
-        })
+        }, generation)
     }
-    private async restartWithFreshTransportFallback(transport: TransportType): Promise<void> {
+    private async retryWebTransportOrFallback(
+        reason: TransportShutdown,
+        generation: number,
+    ): Promise<void> {
+        if (!this.isCurrentControlGeneration(generation)) {
+            return
+        }
+
+        if (this.webTransportReprobeState == "probing") {
+            this.webTransportReprobeState = "spent"
+            this.debugLog(
+                `Controlled WebTransport re-probe ended after ${reason}; returning to WebSocket without scheduling another automatic probe.`,
+                { type: "ifErrorDescription" },
+            )
+            await this.restartWithFreshTransportFallback("websocket", generation)
+            return
+        }
+
+        if (this.webTransportEstablishedRetryCount < WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT) {
+            this.webTransportEstablishedRetryCount++
+            this.debugLog(
+                `WebTransport recovery retry ${this.webTransportEstablishedRetryCount}/${WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT} after ${reason}; reconnecting with a fresh authenticated control WebSocket and WebTransport token.`,
+                { type: "ifErrorDescription" },
+            )
+            await this.restartWithFreshTransportFallback("webtransport", generation)
+            return
+        }
+
+        if (this.webTransportReprobeState == "idle") {
+            this.webTransportReprobeState = "pending"
+        }
+        this.debugLog(
+            `WebTransport recovery retry budget exhausted (${this.webTransportEstablishedRetryCount}/${WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT}) after ${reason}; falling back to WebSocket${this.webTransportReprobeState == "pending" ? " with one controlled re-probe after stability" : ""}.`,
+            { type: "ifErrorDescription" },
+        )
+        await this.restartWithFreshTransportFallback("websocket", generation)
+    }
+    private armWebTransportStabilityReset(
+        transport: WebTransportTransport,
+        generation: number,
+    ): void {
+        this.clearWebTransportStabilityTimer()
+        this.webTransportStabilityTransport = transport
+        this.webTransportStabilityTimer = window.setTimeout(() => {
+            if (
+                !this.isCurrentControlGeneration(generation) ||
+                this.webTransportStabilityTransport != transport
+            ) {
+                return
+            }
+            this.webTransportStabilityTimer = null
+            this.webTransportStabilityTransport = null
+            if (this.transport != transport) {
+                return
+            }
+
+            const previousRetryCount = this.webTransportEstablishedRetryCount
+            const previousReprobeState = this.webTransportReprobeState
+            this.webTransportEstablishedRetryCount = 0
+            this.webTransportReprobeState = "idle"
+            this.clearWebTransportReprobeTimer()
+            this.debugLog(
+                `WebTransport remained stable for ${WEBTRANSPORT_STABILITY_RESET_MS}ms; retry budget reset from ${previousRetryCount}/${WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT} to 0/${WEBTRANSPORT_ESTABLISHED_RETRY_LIMIT} and re-probe state reset from ${previousReprobeState} to idle.`,
+            )
+        }, WEBTRANSPORT_STABILITY_RESET_MS)
+    }
+    private clearWebTransportStabilityTimer(transport?: WebTransportTransport): void {
+        if (transport && this.webTransportStabilityTransport != transport) {
+            return
+        }
+        if (this.webTransportStabilityTimer != null) {
+            window.clearTimeout(this.webTransportStabilityTimer)
+            this.webTransportStabilityTimer = null
+        }
+        this.webTransportStabilityTransport = null
+    }
+    private armWebTransportReprobeAfterWebSocketStability(
+        transport: WebSocketTransport,
+        generation: number,
+    ): void {
+        if (
+            this.webTransportReprobeState != "pending" ||
+            this.transportOverride != "websocket" ||
+            (
+                this.webTransportReprobeTransport == transport &&
+                this.webTransportReprobeTimer != null
+            )
+        ) {
+            return
+        }
+
+        this.clearWebTransportReprobeTimer()
+        this.webTransportReprobeTransport = transport
+        this.webTransportReprobeDeadline = performance.now() + WEBTRANSPORT_REPROBE_COOLDOWN_MS
+        this.webTransportReprobeTimer = window.setTimeout(() => {
+            if (
+                !this.isCurrentControlGeneration(generation) ||
+                this.transport != transport ||
+                this.webTransportReprobeTransport != transport ||
+                this.transportOverride != "websocket" ||
+                this.webTransportReprobeState != "pending"
+            ) {
+                return
+            }
+
+            this.webTransportReprobeTimer = null
+            this.webTransportReprobeTransport = null
+            this.webTransportReprobeDeadline = null
+            const notifyShutdown = transport.onclose
+            if (!notifyShutdown) {
+                return
+            }
+            this.webTransportReprobeState = "probing"
+            const probeTransport = this.settings.dataTransport == "webtransport"
+                ? "webtransport"
+                : "auto"
+            this.debugLog(
+                `WebSocket fallback remained stable for ${WEBTRANSPORT_REPROBE_COOLDOWN_MS}ms; starting the one controlled ${probeTransport} re-probe.`,
+            )
+            // Resolve the existing WebSocket connection task instead of
+            // starting a competing restart. Its single-flight shutdown path
+            // consumes the probing state and owns the fresh control generation.
+            notifyShutdown("disconnect")
+        }, WEBTRANSPORT_REPROBE_COOLDOWN_MS)
+    }
+    private clearWebTransportReprobeTimer(): void {
+        if (this.webTransportReprobeTimer != null) {
+            window.clearTimeout(this.webTransportReprobeTimer)
+            this.webTransportReprobeTimer = null
+        }
+        this.webTransportReprobeTransport = null
+        this.webTransportReprobeDeadline = null
+    }
+    private selectWebSocketReconnectTransport(): TransportType {
+        if (
+            this.webTransportReprobeState == "pending" &&
+            this.webTransportReprobeDeadline != null &&
+            performance.now() >= this.webTransportReprobeDeadline
+        ) {
+            this.webTransportReprobeState = "probing"
+            this.webTransportReprobeDeadline = null
+            this.debugLog("The stable-WebSocket re-probe deadline elapsed while browser timers were delayed; probing WebTransport on this reconnect.")
+        }
+        if (this.settings.dataTransport == "webtransport") {
+            this.webTransportReprobeState = "probing"
+            this.debugLog("Forced WebTransport mode: probing WebTransport on this natural WebSocket reconnect.")
+            return "webtransport"
+        }
+        if (this.settings.dataTransport == "auto" && this.webTransportReprobeState == "probing") {
+            this.debugLog("Auto transport is consuming its controlled WebTransport re-probe.")
+            return "auto"
+        }
+        return "websocket"
+    }
+    private restartWithFreshTransportFallback(
+        transport: TransportType,
+        sourceGeneration = this.controlGeneration,
+    ): Promise<void> {
+        if (this.stopping) {
+            return Promise.resolve()
+        }
+        if (!this.isCurrentControlGeneration(sourceGeneration)) {
+            return Promise.resolve()
+        }
+        if (this.controlRestartTask) {
+            return this.controlRestartTask
+        }
+
+        const task = this.performRestartWithFreshTransportFallback(transport, sourceGeneration)
+        this.controlRestartTask = task
+        return this.waitForControlRestart(task)
+    }
+
+    private async waitForControlRestart(task: Promise<void>): Promise<void> {
+        try {
+            await task
+        } finally {
+            if (this.controlRestartTask == task) {
+                this.controlRestartTask = null
+            }
+        }
+    }
+
+    private async performRestartWithFreshTransportFallback(
+        transport: TransportType,
+        sourceGeneration: number,
+    ): Promise<void> {
+        if (!this.isCurrentControlGeneration(sourceGeneration)) {
+            return
+        }
+
+        // Reserve the replacement generation synchronously, before any close
+        // or reconnect await. Every callback and continuation belonging to
+        // the old control socket becomes stale at this point.
+        const replacementGeneration = sourceGeneration + 1
+        this.controlGeneration = replacementGeneration
         this.transportOverride = transport
         this.resetVideoReadyState()
+        this.clearWebTransportStabilityTimer()
+        this.clearWebTransportReprobeTimer()
+        this.connectionCompleteSetup = Promise.resolve()
+        // WebTransport URLs are one-use authenticated tokens. Retire the old
+        // socket's setup state at the same instant as its generation.
+        this.webTransportUrl = null
+        this.iceServers = null
+        this.wsSendBuffer.length = 0
+        this.clearWebTransportControl()
+
+        const oldWs = this.ws
+        this.retiringControlSockets.add(oldWs)
 
         if (this.transport) {
             await this.transport.close()
             this.transport = null
         }
 
-        this.wsSendBuffer.length = 0
-        const oldWs = this.ws
+        await this.retireControlSocket(oldWs)
 
-        if (oldWs.readyState != WebSocket.CLOSED) {
-            if (oldWs.readyState == WebSocket.OPEN || oldWs.readyState == WebSocket.CONNECTING) {
-                oldWs.close()
-            }
-            await new Promise<void>((resolve) => {
-                const timeout = window.setTimeout(() => resolve(), 1000)
-                oldWs.addEventListener("close", () => {
-                    window.clearTimeout(timeout)
-                    resolve()
-                }, { once: true })
-            })
+        if (!this.isCurrentControlGeneration(replacementGeneration)) {
+            return
         }
 
-        await new Promise((resolve) => window.setTimeout(resolve, FALLBACK_RECONNECT_DELAY_MS))
+        this.ws = this.createControlWebSocket(replacementGeneration)
+        this.controlSocketGeneration = replacementGeneration
+        this.sendInitMessage(replacementGeneration)
+    }
 
-        this.ws = this.createControlWebSocket()
-        this.sendInitMessage()
+    private async retireControlSocket(ws: WebSocket): Promise<void> {
+        if (ws.readyState == WebSocket.CLOSED) {
+            return
+        }
+
+        const closeObserved = await new Promise<boolean>((resolve) => {
+            let settled = false
+            let timeout: number | null = null
+            const finish = (observed: boolean) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                if (timeout != null) {
+                    window.clearTimeout(timeout)
+                }
+                ws.removeEventListener("close", onClose)
+                resolve(observed)
+            }
+            const onClose = () => finish(true)
+
+            // Register before close() so even an unusually fast implementation
+            // cannot force every reconnect through the timeout path.
+            ws.addEventListener("close", onClose, { once: true })
+            timeout = window.setTimeout(
+                () => finish(false),
+                CONTROL_SOCKET_CLOSE_TIMEOUT_MS,
+            )
+            try {
+                if (ws.readyState == WebSocket.OPEN || ws.readyState == WebSocket.CONNECTING) {
+                    ws.close()
+                }
+            } catch (_error) { }
+            if (ws.readyState == WebSocket.CLOSED) {
+                finish(true)
+            }
+        })
+
+        if (!closeObserved) {
+            this.debugLog(
+                `Old control WebSocket did not close within ${CONTROL_SOCKET_CLOSE_TIMEOUT_MS}ms; continuing with the fresh generation.`,
+                { type: "ifErrorDescription" },
+            )
+        }
     }
 
     private setTransport(transport: Transport) {
@@ -414,6 +815,9 @@ export class Stream implements Component {
         }
 
         this.transport = transport
+        if (this.webTransportControl?.transport != transport) {
+            this.clearWebTransportControl()
+        }
 
         this.input.setTransport(this.transport)
         this.stats.setTransport(this.transport)
@@ -445,6 +849,126 @@ export class Stream implements Component {
         } else {
             this.debugLog(`[GENERAL] Cannot register listener, channel type is not 'data'`)
         }
+    }
+
+    private bindWebTransportControl(
+        transport: WebTransportTransport,
+        generation: number,
+    ): boolean {
+        this.clearWebTransportControl()
+
+        const channel = transport.getChannel(TransportChannelId.STREAM_CONTROL)
+        if (channel.type != "data") {
+            this.debugLog("WebTransport STREAM_CONTROL is not a data channel", { type: "fatalDescription" })
+            return false
+        }
+
+        const listener = (data: ArrayBuffer) => {
+            const active = this.webTransportControl
+            if (
+                !active ||
+                active.transport != transport ||
+                active.channel != channel ||
+                active.listener != listener ||
+                active.generation != generation ||
+                !this.isCurrentControlGeneration(generation) ||
+                this.transport != transport
+            ) {
+                return
+            }
+            if (data.byteLength == 0 || data.byteLength > MAX_STREAM_CONTROL_JSON_BYTES) {
+                throw new Error("Invalid WebTransport STREAM_CONTROL payload size")
+            }
+
+            const raw = this.streamControlDecoder.decode(new Uint8Array(data))
+            const parsed: unknown = JSON.parse(raw)
+            if (typeof parsed != "object" || parsed == null || Array.isArray(parsed)) {
+                throw new Error("Invalid WebTransport STREAM_CONTROL JSON value")
+            }
+            const keys = Object.keys(parsed)
+            if (keys.length != 1 || !STREAM_SERVER_CONTROL_KEYS.has(keys[0])) {
+                throw new Error("Disallowed WebTransport STREAM_CONTROL message")
+            }
+
+            void this.onMessage(parsed as StreamServerMessage, generation).catch((error) => {
+                const current = this.webTransportControl
+                if (
+                    current?.transport == transport &&
+                    current.channel == channel &&
+                    current.listener == listener &&
+                    current.generation == generation &&
+                    this.transport == transport
+                ) {
+                    // Synchronous framing/JSON failures already escape through
+                    // the receive loop. Do the same for shape errors discovered
+                    // after onMessage awaits decoder/audio setup so an invalid
+                    // control frame cannot leave an apparently live, stuck QUIC
+                    // session after the setup WebSocket has been retired.
+                    transport.failStreamControl(error)
+                }
+            })
+        }
+        channel.addReceiveListener(listener)
+        this.webTransportControl = { transport, channel, generation, listener }
+        return true
+    }
+
+    private clearWebTransportControl(transport?: WebTransportTransport): void {
+        const active = this.webTransportControl
+        if (!active || (transport && active.transport != transport)) {
+            return
+        }
+        active.channel.removeReceiveListener(active.listener)
+        this.webTransportControl = null
+    }
+
+    private hasActiveWebTransportControl(generation: number): boolean {
+        const active = this.webTransportControl
+        return (
+            !!active &&
+            active.generation == generation &&
+            active.transport == this.transport &&
+            this.isCurrentControlGeneration(generation)
+        )
+    }
+
+    private sendWebTransportControl(
+        transport: WebTransportTransport,
+        message: StreamClientMessage,
+        generation: number,
+    ): boolean {
+        const active = this.webTransportControl
+        if (
+            !active ||
+            active.transport != transport ||
+            active.transport != this.transport ||
+            active.generation != generation ||
+            !this.isCurrentControlGeneration(generation)
+        ) {
+            return false
+        }
+
+        const payload = this.streamControlEncoder.encode(JSON.stringify(message))
+        if (payload.byteLength == 0 || payload.byteLength > MAX_STREAM_CONTROL_JSON_BYTES) {
+            this.debugLog("Refusing an invalid WebTransport STREAM_CONTROL payload", { type: "fatalDescription" })
+            return false
+        }
+
+        // STREAM_CONTROL uses the ordinary reliable lane, where control frames
+        // are strict ordering barriers and are never snapshot-coalesced.
+        active.channel.send(payload.buffer)
+        return true
+    }
+
+    private sendStreamControl(
+        message: StreamClientMessage,
+        generation: number,
+    ): boolean {
+        if (this.transport instanceof WebTransportTransport) {
+            return this.sendWebTransportControl(this.transport, message, generation)
+        }
+        this.sendWsMessage(message, generation)
+        return true
     }
 
     private onGeneralChannelMessage(data: ArrayBuffer) {
@@ -520,7 +1044,7 @@ export class Stream implements Component {
         return true
     }
 
-    private async tryWebRTCTransport(): Promise<TransportShutdown> {
+    private async tryWebRTCTransport(generation: number): Promise<TransportShutdown> {
         if (!this.permissions.allow_transport_webrtc) {
             this.debugLog("Not trying WebRTC transport because permissions disallow it")
             return "failednoconnect"
@@ -530,7 +1054,7 @@ export class Stream implements Component {
 
         this.sendWsMessage({
             SetTransport: "WebRTC"
-        })
+        }, generation)
 
         if (!this.iceServers) {
             this.debugLog(`Failed to try WebRTC Transport: no ice servers available`)
@@ -538,7 +1062,7 @@ export class Stream implements Component {
         }
 
         const transport = new WebRTCTransport(this.logger)
-        transport.onsendmessage = (message) => this.sendWsMessage({ WebRtc: message })
+        transport.onsendmessage = (message) => this.sendWsMessage({ WebRtc: message }, generation)
 
         transport.initPeer({
             iceServers: this.iceServers
@@ -546,6 +1070,10 @@ export class Stream implements Component {
         this.setTransport(transport)
 
         const videoCodecSupport = await this.createPipelines()
+        if (!this.isCurrentControlGeneration(generation)) {
+            await transport.close()
+            return "disconnect"
+        }
         if (!videoCodecSupport) {
             this.debugLog("No video pipeline was found for the codec that was specified. If you're unsure which codecs are supported use H264.", { type: "fatalDescription" })
 
@@ -554,7 +1082,7 @@ export class Stream implements Component {
         }
 
         // Starting the stream will start negotiation
-        await this.startStream(videoCodecSupport)
+        await this.startStream(videoCodecSupport, generation)
 
         // Wait for negotiation, but don't let a stuck ICE check block fallback forever.
         const result = await new Promise<boolean>((resolve) => {
@@ -575,6 +1103,10 @@ export class Stream implements Component {
                 resolve(false)
             }
         })
+        if (!this.isCurrentControlGeneration(generation)) {
+            await transport.close()
+            return "disconnect"
+        }
         this.debugLog(`WebRTC negotiation success: ${result}`)
 
         if (!result) {
@@ -587,7 +1119,7 @@ export class Stream implements Component {
             }
         })
     }
-    private async tryWebTransport(): Promise<TransportShutdown> {
+    private async tryWebTransport(generation: number): Promise<TransportShutdown> {
         if (!this.permissions.allow_transport_websockets) {
             this.debugLog("Not trying WebTransport because permissions disallow browser relay transports")
             return "failednoconnect"
@@ -603,11 +1135,12 @@ export class Stream implements Component {
 
         this.debugLog("Trying WebTransport")
         const transport = new WebTransportTransport(this.webTransportUrl, this.logger)
-        let resolveShutdown: (shutdown: TransportShutdown) => void = () => {}
         const shutdown = new Promise<TransportShutdown>((resolve) => {
-            resolveShutdown = resolve
+            transport.onclose = (reason) => {
+                transport.onclose = null
+                resolve(reason)
+            }
         })
-        transport.onclose = resolveShutdown
 
         try {
             await transport.connect(WEBTRANSPORT_CONNECT_TIMEOUT_MS)
@@ -617,24 +1150,56 @@ export class Stream implements Component {
             return "failednoconnect"
         }
 
-        // Selecting the relay before QUIC is ready can strand the streamer on a
-        // transport the browser cannot receive. Only switch after ready resolves.
-        this.sendWsMessage({
-            SetTransport: "WebTransport"
-        })
-        this.setTransport(transport)
+        if (!this.isCurrentControlGeneration(generation)) {
+            await transport.close()
+            return "disconnect"
+        }
 
-        const videoCodecSupport = await this.createPipelines()
-        if (!videoCodecSupport) {
-            this.debugLog("Failed to start WebTransport because no supported video pipeline was found", { type: "fatalDescription" })
+        // Bind the inbound control path before selecting QUIC. SetTransport and
+        // StartStream then enter the same ordered, reliable lane in that order.
+        if (!this.bindWebTransportControl(transport, generation)) {
+            await transport.close()
+            return "failednoconnect"
+        }
+        this.setTransport(transport)
+        if (!this.sendWebTransportControl(transport, {
+            SetTransport: "WebTransport"
+        }, generation)) {
+            this.clearWebTransportControl(transport)
             await transport.close()
             return "failednoconnect"
         }
 
-        await this.startStream(videoCodecSupport)
-        return shutdown
+        const videoCodecSupport = await this.createPipelines()
+        if (!this.isCurrentControlGeneration(generation)) {
+            this.clearWebTransportControl(transport)
+            await transport.close()
+            return "disconnect"
+        }
+        if (!videoCodecSupport) {
+            this.debugLog("Failed to start WebTransport because no supported video pipeline was found", { type: "fatalDescription" })
+            this.clearWebTransportControl(transport)
+            await transport.close()
+            return "failednoconnect"
+        }
+
+        if (!await this.startStream(videoCodecSupport, generation)) {
+            this.clearWebTransportControl(transport)
+            await transport.close()
+            return "failednoconnect"
+        }
+        if (!this.isCurrentControlGeneration(generation)) {
+            this.clearWebTransportControl(transport)
+            await transport.close()
+            return "disconnect"
+        }
+        this.armWebTransportStabilityReset(transport, generation)
+        const shutdownReason = await shutdown
+        this.clearWebTransportStabilityTimer(transport)
+        this.clearWebTransportControl(transport)
+        return shutdownReason
     }
-    private async tryWebSocketTransport(): Promise<TransportShutdown | null> {
+    private async tryWebSocketTransport(generation: number): Promise<TransportShutdown | null> {
         if (!this.permissions.allow_transport_websockets) {
             this.debugLog("Not trying WebSocket transport becaues permissions disallow it")
             return null
@@ -644,25 +1209,34 @@ export class Stream implements Component {
 
         this.sendWsMessage({
             SetTransport: "WebSocket"
-        })
+        }, generation)
 
         const transport = new WebSocketTransport(this.ws, BIG_BUFFER, this.logger)
-        let resolveShutdown: (shutdown: TransportShutdown) => void = () => {}
         const shutdown = new Promise<TransportShutdown>((resolve) => {
-            resolveShutdown = resolve
+            transport.onclose = (reason) => {
+                transport.onclose = null
+                resolve(reason)
+            }
         })
-        transport.onclose = resolveShutdown
 
         this.setTransport(transport)
 
         const videoCodecSupport = await this.createPipelines()
+        if (!this.isCurrentControlGeneration(generation)) {
+            await transport.close()
+            return "disconnect"
+        }
         if (!videoCodecSupport) {
             this.debugLog("Failed to start stream because no video pipeline with support for the specified codec was found!", { type: "fatalDescription" })
             await transport.close()
             return null
         }
 
-        await this.startStream(videoCodecSupport)
+        await this.startStream(videoCodecSupport, generation)
+        if (!this.isCurrentControlGeneration(generation)) {
+            await transport.close()
+            return "disconnect"
+        }
 
         return shutdown
     }
@@ -760,13 +1334,7 @@ export class Stream implements Component {
 
                 // data pipeline support requesting idrs over video channel
                 if (videoRenderer.pollRequestIdr()) {
-                    const buffer = new ByteBuffer(1)
-
-                    buffer.putU8(0)
-
-                    buffer.flip()
-
-                    video.send(buffer.getRemainingBuffer().buffer)
+                    this.requestHostVideoIdr(video)
                 }
             })
 
@@ -777,6 +1345,15 @@ export class Stream implements Component {
         }
 
         return pipelineCodecSupport
+    }
+    private requestHostVideoIdr(video: DataTransportChannel) {
+        const buffer = new ByteBuffer(1)
+
+        buffer.putU8(0)
+
+        buffer.flip()
+
+        video.send(buffer.getRemainingBuffer().buffer)
     }
     private async createAudioPlayer(): Promise<boolean> {
         if (this.audioPlayer) {
@@ -829,13 +1406,20 @@ export class Stream implements Component {
 
         return true
     }
-    private async startStream(videoCodecSupport: VideoCodecSupport): Promise<void> {
+    private async startStream(
+        videoCodecSupport: VideoCodecSupport,
+        generation = this.controlGeneration,
+    ): Promise<boolean> {
         const settings: StreamSettings = {
             bitrate_kbps: this.settings.bitrate,
+            adaptive_bitrate: this.settings.adaptiveBitrate,
+            minimum_bitrate_kbps: this.settings.minimumBitrate,
             fps: this.settings.fps,
             width: this.streamerSize[0],
             height: this.streamerSize[1],
             play_audio_local: this.settings.playAudioLocal,
+            encrypt_host_video: this.settings.encryptHostVideo,
+            encrypt_host_audio: this.settings.encryptHostAudio,
             supported_codecs: createSupportedVideoFormatsBits(videoCodecSupport),
             hdr: this.settings.hdr ?? false,
         }
@@ -858,7 +1442,7 @@ export class Stream implements Component {
             }
         }
 
-        this.sendWsMessage(message)
+        return this.sendStreamControl(message, generation)
     }
 
     mount(parent: HTMLElement): void {
@@ -876,17 +1460,58 @@ export class Stream implements Component {
     }
 
     // -- Raw Web Socket stuff
-    private wsSendBuffer: Array<string> = []
+    private wsSendBuffer: Array<{ generation: number, raw: string }> = []
 
-    private onWsOpen() {
+    private onWsOpen(ws: WebSocket, generation: number) {
         this.debugLog(`Web Socket Open`)
 
-        for (const raw of this.wsSendBuffer.splice(0)) {
-            this.ws.send(raw)
+        for (const pending of this.wsSendBuffer.splice(0)) {
+            if (pending.generation == generation) {
+                ws.send(pending.raw)
+            }
         }
     }
-    private onWsClose() {
-        this.debugLog(`Web Socket Closed`)
+    private onWsClose(ws: WebSocket, generation: number, event: CloseEvent) {
+        if (!this.isCurrentControlSocket(ws, generation)) {
+            return
+        }
+        if (this.stopping) {
+            this.debugLog("Control WebSocket closed while the stream was stopping; reconnect suppressed.")
+            return
+        }
+        if (this.hasActiveWebTransportControl(generation)) {
+            this.debugLog("Setup WebSocket closed after WebTransport handoff; the active WebTransport remains authoritative.")
+            return
+        }
+
+        this.debugLog(
+            `Control WebSocket closed unexpectedly (code=${event.code}, clean=${event.wasClean}, reason=${event.reason || "none"}).`,
+            { type: "ifErrorDescription" },
+        )
+
+        // WebSocketTransport owns the same socket. Its close listener resolves
+        // the active transport attempt, which then performs the sole guarded
+        // restart. Starting another one here would race the two generations.
+        if (this.transport instanceof WebSocketTransport) {
+            this.debugLog("WebSocket data transport will handle the control socket closure.")
+            return
+        }
+        if (this.controlRecoveryGeneration == generation) {
+            return
+        }
+        this.controlRecoveryGeneration = generation
+
+        // The socket can close before transport selection (for example while
+        // waiting for Setup). No transport promise exists to own recovery in
+        // that state, so start the same single-flight fresh-generation path.
+        const reconnectTransport = this.transportOverride ?? this.settings.dataTransport
+        this.debugLog(`Control socket closed before an active transport could handle it; reconnecting with ${reconnectTransport}.`)
+        void this.restartWithFreshTransportFallback(reconnectTransport, generation).catch((error) => {
+            this.debugLog(
+                `Control socket recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+                { type: "fatalDescription" },
+            )
+        })
     }
     private onError(event: Event) {
         this.debugLog(`Web Socket or WebRtcPeer Error`)
@@ -894,25 +1519,51 @@ export class Stream implements Component {
         console.error(`Web Socket or WebRtcPeer Error`, event)
     }
 
-    private sendWsMessage(message: StreamClientMessage) {
+    private sendWsMessage(
+        message: StreamClientMessage,
+        generation = this.controlGeneration,
+    ) {
+        if (!this.isCurrentControlGeneration(generation)) {
+            return
+        }
+
         const raw = JSON.stringify(message)
-        if (this.ws.readyState == WebSocket.OPEN) {
+        if (
+            this.controlSocketGeneration == generation &&
+            this.ws.readyState == WebSocket.OPEN
+        ) {
             this.ws.send(raw)
         } else {
-            this.wsSendBuffer.push(raw)
+            this.wsSendBuffer.push({ generation, raw })
         }
     }
-    private onRawWsMessage(event: MessageEvent) {
+    private onRawWsMessage(event: MessageEvent, generation: number) {
+        if (this.hasActiveWebTransportControl(generation)) {
+            return
+        }
         const message = event.data
         if (typeof message == "string") {
             const json = JSON.parse(message)
 
-            this.onMessage(json)
+            void this.onMessage(json, generation)
         }
     }
 
     stop(): Promise<boolean> {
-        if (!this.sendGeneralMessage("Stop")) {
+        if (this.stopping) {
+            return Promise.resolve(false)
+        }
+        this.stopping = true
+        // The data-channel Stop must be enqueued while the current transport is
+        // still usable. Immediately afterward, invalidate every async control
+        // continuation before this method can await or return.
+        const stopSent = this.sendGeneralMessage("Stop")
+        this.controlGeneration++
+        this.clearWebTransportControl()
+        this.clearWebTransportStabilityTimer()
+        this.clearWebTransportReprobeTimer()
+        this.wsSendBuffer.length = 0
+        if (!stopSent) {
             return Promise.resolve(false)
         }
 

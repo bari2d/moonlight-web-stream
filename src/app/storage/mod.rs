@@ -44,6 +44,15 @@ pub struct StorageUser {
     pub password: Option<StoragePassword>,
     pub role_id: RoleId,
     pub client_unique_id: String,
+    pub settings: Option<Value>,
+    pub settings_revision: u64,
+    pub settings_mutation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageSettingsMutation {
+    pub revision: u64,
+    pub applied: bool,
 }
 #[derive(Clone)]
 pub struct StorageUserAdd {
@@ -185,6 +194,15 @@ pub trait Storage {
     /// No duplicate names are allowed!
     async fn add_user(&self, user: StorageUserAdd) -> Result<StorageUser, AppError>;
     async fn modify_user(&self, user_id: UserId, user: StorageUserModify) -> Result<(), AppError>;
+    /// Applies a top-level merge patch to a user's personal settings (or clears
+    /// them when `settings` is `None`), increments their monotonic settings
+    /// revision, and waits until both values are durably persisted.
+    async fn modify_user_settings(
+        &self,
+        user_id: UserId,
+        settings: Option<Value>,
+        mutation_id: String,
+    ) -> Result<StorageSettingsMutation, AppError>;
     async fn get_user(&self, user_id: UserId) -> Result<StorageUser, AppError>;
     /// The returned tuple can contain a StorageUser if the Storage thinks it's more efficient to query all data directly
     async fn get_user_by_name(&self, name: &str)

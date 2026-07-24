@@ -2,7 +2,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,7 +19,10 @@ use common::{
         LogMessageType, PostCancelRequest, PostCancelResponse, StreamClientMessage,
         StreamServerMessage, TransportChannelId, TransportType,
     },
-    ipc::{IpcSender, ServerIpcMessage, StreamerConfig, StreamerIpcMessage, create_child_ipc},
+    ipc::{
+        IpcSender, NetworkFeedback, ServerIpcMessage, StreamerConfig, StreamerIpcMessage,
+        create_child_ipc,
+    },
     serialize_json,
 };
 use log::{debug, error, info, warn};
@@ -45,6 +48,7 @@ const WEB_TRANSPORT_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_STOP_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(11);
 const FORWARDER_JOIN_TIMEOUT: Duration = Duration::from_secs(14);
+const MAX_STREAM_CONTROL_JSON_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedTransport {
@@ -55,6 +59,12 @@ enum SelectedTransport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayRoute {
+    WebSocket,
+    WebTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSource {
     WebSocket,
     WebTransport,
 }
@@ -317,18 +327,19 @@ pub async fn start_host(
         let (forwarder_done_tx, mut forwarder_done_rx) = mpsc::channel(1);
         let web_transport_hub = web_transport.get_ref().as_ref().cloned();
         let control_session = session.clone();
+        let websocket_recovery_requests = Arc::new(AtomicU64::new(0));
 
-        // Redirect streamer output into the selected browser relay. JSON and
-        // lifecycle messages always remain on the authenticated WebSocket. The
-        // one-use WebTransport credential is intentionally minted only when the
-        // streamer emits Setup, immediately before the browser begins transport
-        // selection. Host discovery and dynamic ICE work therefore cannot use
-        // up the token's lifetime.
+        // Redirect streamer output into the selected browser relay. The
+        // authenticated WebSocket carries setup JSON only; after WebTransport
+        // selection, control JSON and media both use the authenticated QUIC
+        // bridge. The one-use credential is intentionally minted only when the
+        // streamer emits Setup, immediately before transport selection.
         let mut forwarder = spawn({
             let ipc_sender = ipc_sender.clone();
             let relay_route = relay_route.clone();
             let mut web_transport_setup_tx = Some(web_transport_setup_tx);
             let mut session_shutdown_rx = session_shutdown_rx;
+            let websocket_recovery_requests = websocket_recovery_requests.clone();
             async move {
                 let mut web_transport_outbound = None;
                 let mut request_child_stop = false;
@@ -413,17 +424,41 @@ pub async fn start_host(
                                 }
                             }
 
-                            let send_result = tokio::select! {
-                                biased;
-                                _ = wait_for_shutdown(&mut session_shutdown_rx) => {
-                                    request_child_stop = true;
-                                    break 'forwarding;
+                            // Route choice and WebSocket enqueue share the same
+                            // handoff barrier used by transport selection.
+                            let websocket_result = {
+                                let route = relay_route
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if *route == RelayRoute::WebSocket {
+                                    Some(send_ws_message_now(&session, &message).map_err(|_| ()))
+                                } else {
+                                    None
                                 }
-                                result = send_ws_message(&mut session, message) => result,
+                            };
+                            let send_result: Result<(), ()> = match websocket_result {
+                                Some(result) => result,
+                                None => {
+                                    let Ok(frame) = encode_stream_control_message(&message) else {
+                                        request_child_stop = true;
+                                        break 'forwarding;
+                                    };
+                                    match web_transport_outbound.as_ref() {
+                                        Some(sender) => tokio::select! {
+                                            biased;
+                                            _ = wait_for_shutdown(&mut session_shutdown_rx) => {
+                                                request_child_stop = true;
+                                                break 'forwarding;
+                                            }
+                                            result = sender.send(frame) => result.map_err(|_| ()),
+                                        },
+                                        None => Err(()),
+                                    }
+                                }
                             };
                             if send_result.is_err() {
                                 warn!(
-                                    "[Ipc]: control WebSocket closed while forwarding a streamer message"
+                                    "[Ipc]: selected control relay closed while forwarding a streamer message"
                                 );
                                 request_child_stop = true;
                                 break 'forwarding;
@@ -473,6 +508,19 @@ pub async fn start_host(
                                             request_child_stop = true;
                                             break 'forwarding;
                                         }
+                                        let recovery_requests = websocket_recovery_requests
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            .saturating_add(1);
+                                        // Congestion telemetry has its own
+                                        // one-value IPC slot. A newer sample
+                                        // replaces an unsent one instead of
+                                        // delaying the IDR request or input.
+                                        let _ = ipc_sender.try_send_latest(
+                                            ServerIpcMessage::NetworkFeedback(NetworkFeedback {
+                                                recovery_requests,
+                                                ..NetworkFeedback::default()
+                                            }),
+                                        );
                                     }
                                     Err(_) => {
                                         warn!(
@@ -566,6 +614,9 @@ pub async fn start_host(
         let mut web_transport_inbound: Option<mpsc::Receiver<Bytes>> = None;
         let mut web_transport_state = None;
         let mut web_transport_shutdown = None;
+        let mut web_transport_feedback = None;
+        let mut control_websocket_open = true;
+        let mut stream_started = false;
 
         // Redirect control WebSocket and WebTransport input into IPC. Once
         // WebTransport is selected, this session cannot switch its bytes back
@@ -583,6 +634,7 @@ pub async fn start_host(
                                 continue 'control;
                             }
                             web_transport_state = Some(bridge.state.clone());
+                            web_transport_feedback = Some(bridge.feedback.clone());
                             web_transport_shutdown = Some(bridge.shutdown_signal());
                             let (_unused_sender, empty_receiver) = mpsc::channel(1);
                             web_transport_inbound = Some(std::mem::replace(
@@ -608,6 +660,7 @@ pub async fn start_host(
                             web_transport_state = None;
                             web_transport_inbound = None;
                             web_transport_shutdown = None;
+                            web_transport_feedback = None;
                             if let Some(bridge) = web_transport_bridge.take() {
                                 bridge.shutdown();
                             }
@@ -625,6 +678,7 @@ pub async fn start_host(
                     if shutdown.unwrap_or(true) {
                         web_transport_inbound = None;
                         web_transport_state = None;
+                        web_transport_feedback = None;
                         if let Some(bridge) = web_transport_bridge.take() {
                             bridge.shutdown();
                         }
@@ -636,74 +690,67 @@ pub async fn start_host(
                         }
                     }
                 }
-                message = stream.recv() => {
+                feedback = receive_web_transport_feedback(&mut web_transport_feedback) => {
+                    match feedback {
+                        Some(feedback)
+                            if selected_transport == Some(SelectedTransport::WebTransport) =>
+                        {
+                            // This nonblocking latest-value slot is drained
+                            // after reliable browser input. Together with the
+                            // source watch, it keeps only the newest unsent
+                            // 500 ms snapshot across the IPC boundary.
+                            let _ = ipc_sender.try_send_latest(
+                                ServerIpcMessage::NetworkFeedback(feedback),
+                            );
+                        }
+                        Some(_) => {}
+                        None => web_transport_feedback = None,
+                    }
+                }
+                message = async {
+                    if control_websocket_open {
+                        stream.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
                     let Some(Ok(message)) = message else {
+                        if selected_transport == Some(SelectedTransport::WebTransport) {
+                            control_websocket_open = false;
+                            continue 'control;
+                        }
                         break 'control;
                     };
                     match message {
                         Message::Text(text) => {
+                            if selected_transport == Some(SelectedTransport::WebTransport) {
+                                // Once route handoff completes, lane 4 is the
+                                // sole ordered control source. Ignore any text
+                                // already queued on the retiring setup socket.
+                                continue 'control;
+                            }
                             let Ok(message) = serde_json::from_str::<StreamClientMessage>(&text) else {
                                 warn!("[Stream]: failed to deserialize from json");
                                 break 'control;
                             };
-
-                            if let StreamClientMessage::SetTransport(transport) = &message {
-                                let requested = SelectedTransport::from(transport);
-                                if let Some(selected) = selected_transport {
-                                    if selected == requested {
-                                        // Transport creation is not idempotent in
-                                        // the child. Ignore duplicate selection
-                                        // instead of recreating it in place.
-                                        continue 'control;
-                                    }
-                                    warn!(
-                                        "[Stream]: refusing an in-place transport switch from {selected:?} to {requested:?}"
-                                    );
-                                    break 'control;
-                                }
-
-                                if requested == SelectedTransport::WebTransport {
-                                    let connected = match web_transport_bridge.as_ref() {
-                                        Some(bridge) => tokio::select! {
-                                            result = timeout(
-                                                WEB_TRANSPORT_SELECTION_TIMEOUT,
-                                                wait_for_web_transport_connection(bridge.state.clone()),
-                                            ) => result.unwrap_or(false),
-                                            _ = forwarder_done_rx.recv() => false,
-                                        },
-                                        None => false,
-                                    };
-                                    if !connected {
-                                        warn!(
-                                            "[Stream]: WebTransport was selected without a live bridge; ending the session"
-                                        );
-                                        break 'control;
-                                    }
-
-                                    let mut route = relay_route
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                    *route = RelayRoute::WebTransport;
-                                    control_session.clear_media();
-                                } else {
-                                    // A one-use bearer URL that will never be
-                                    // consumed should not remain valid until TTL.
-                                    web_transport_inbound = None;
-                                    web_transport_state = None;
-                                    web_transport_shutdown = None;
-                                    if let Some(bridge) = web_transport_bridge.take() {
-                                        bridge.shutdown();
-                                    }
-                                }
-                                selected_transport = Some(requested);
-                            }
-                            if !send_ipc_bounded(
+                            if !handle_stream_control_message(
+                                ControlSource::WebSocket,
+                                message,
+                                &mut selected_transport,
+                                &mut web_transport_bridge,
+                                &mut web_transport_inbound,
+                                &mut web_transport_state,
+                                &mut web_transport_shutdown,
+                                &mut web_transport_feedback,
+                                &relay_route,
+                                &control_session,
+                                &mut control_websocket_open,
+                                &mut stream_started,
                                 &ipc_sender,
-                                ServerIpcMessage::WebSocket(message),
+                                &mut forwarder_done_rx,
                             )
                             .await
                             {
-                                warn!("[Stream]: streamer IPC stalled on a control message");
                                 break 'control;
                             }
                         }
@@ -722,10 +769,21 @@ pub async fn start_host(
                         }
                         Message::Ping(bytes) => {
                             if control_session.pong(&bytes).is_err() {
+                                if selected_transport == Some(SelectedTransport::WebTransport) {
+                                    control_websocket_open = false;
+                                } else {
+                                    break 'control;
+                                }
+                            }
+                        }
+                        Message::Close(reason) => {
+                            if selected_transport == Some(SelectedTransport::WebTransport) {
+                                let _ = control_session.close(reason);
+                                control_websocket_open = false;
+                            } else {
                                 break 'control;
                             }
                         }
-                        Message::Close(_) => break 'control,
                         _ => {}
                     }
                 }
@@ -736,6 +794,32 @@ pub async fn start_host(
                     }
                 } => {
                     match inbound {
+                        Some(frame) if frame.first() == Some(&TransportChannelId::STREAM_CONTROL) => {
+                            let Some(message) = decode_stream_control_message(&frame) else {
+                                warn!("[Stream]: malformed WebTransport control message");
+                                break 'control;
+                            };
+                            if !handle_stream_control_message(
+                                ControlSource::WebTransport,
+                                message,
+                                &mut selected_transport,
+                                &mut web_transport_bridge,
+                                &mut web_transport_inbound,
+                                &mut web_transport_state,
+                                &mut web_transport_shutdown,
+                                &mut web_transport_feedback,
+                                &relay_route,
+                                &control_session,
+                                &mut control_websocket_open,
+                                &mut stream_started,
+                                &ipc_sender,
+                                &mut forwarder_done_rx,
+                            )
+                            .await
+                            {
+                                break 'control;
+                            }
+                        }
                         Some(frame) if selected_transport == Some(SelectedTransport::WebTransport) => {
                             // The select is biased toward state/shutdown above,
                             // so queued input can never replay after QUIC close.
@@ -754,6 +838,7 @@ pub async fn start_host(
                             web_transport_inbound = None;
                             web_transport_state = None;
                             web_transport_shutdown = None;
+                            web_transport_feedback = None;
                             if let Some(bridge) = web_transport_bridge.take() {
                                 bridge.shutdown();
                             }
@@ -808,11 +893,172 @@ fn single_origin_header(request: &HttpRequest) -> Option<String> {
     Some(origin)
 }
 
+fn encode_stream_control_message(message: &StreamServerMessage) -> Result<Bytes, ()> {
+    let Some(json) = serialize_json(message) else {
+        warn!("[Stream]: failed to serialize WebTransport control message");
+        return Err(());
+    };
+    if json.is_empty() || json.len() > MAX_STREAM_CONTROL_JSON_BYTES {
+        warn!("[Stream]: refusing oversized WebTransport control message");
+        return Err(());
+    }
+
+    let mut frame = Vec::with_capacity(json.len() + 1);
+    frame.push(TransportChannelId::STREAM_CONTROL);
+    frame.extend_from_slice(json.as_bytes());
+    Ok(Bytes::from(frame))
+}
+
+fn decode_stream_control_message(frame: &[u8]) -> Option<StreamClientMessage> {
+    let json = frame.strip_prefix(&[TransportChannelId::STREAM_CONTROL])?;
+    if json.is_empty() || json.len() > MAX_STREAM_CONTROL_JSON_BYTES {
+        return None;
+    }
+    let json = std::str::from_utf8(json).ok()?;
+    serde_json::from_str(json).ok()
+}
+
+fn stream_control_allowed(
+    source: ControlSource,
+    message: &StreamClientMessage,
+    selected_transport: Option<SelectedTransport>,
+    stream_started: bool,
+) -> bool {
+    match source {
+        ControlSource::WebTransport => match message {
+            StreamClientMessage::SetTransport(TransportType::WebTransport) => true,
+            StreamClientMessage::StartStream { .. } => {
+                selected_transport == Some(SelectedTransport::WebTransport) && !stream_started
+            }
+            StreamClientMessage::Init { .. }
+            | StreamClientMessage::WebRtc(_)
+            | StreamClientMessage::SetTransport(_) => false,
+        },
+        ControlSource::WebSocket => match message {
+            // In v4 the QUIC control frame is the proof that the advertised
+            // one-use bridge connected. Never select it through the setup WS.
+            StreamClientMessage::SetTransport(TransportType::WebTransport) => false,
+            StreamClientMessage::StartStream { .. } => {
+                selected_transport.is_some() && !stream_started
+            }
+            _ => true,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_control_message(
+    source: ControlSource,
+    message: StreamClientMessage,
+    selected_transport: &mut Option<SelectedTransport>,
+    web_transport_bridge: &mut Option<WebTransportBridge>,
+    web_transport_inbound: &mut Option<mpsc::Receiver<Bytes>>,
+    web_transport_state: &mut Option<watch::Receiver<WebTransportConnectionState>>,
+    web_transport_shutdown: &mut Option<watch::Receiver<bool>>,
+    web_transport_feedback: &mut Option<watch::Receiver<NetworkFeedback>>,
+    relay_route: &Arc<Mutex<RelayRoute>>,
+    control_session: &LowLatencySession,
+    control_websocket_open: &mut bool,
+    stream_started: &mut bool,
+    ipc_sender: &IpcSender<ServerIpcMessage>,
+    forwarder_done_rx: &mut mpsc::Receiver<()>,
+) -> bool {
+    if source == ControlSource::WebSocket
+        && *selected_transport == Some(SelectedTransport::WebTransport)
+    {
+        return true;
+    }
+    if !stream_control_allowed(source, &message, *selected_transport, *stream_started) {
+        warn!("[Stream]: rejected disallowed or replayed control message from {source:?}");
+        return false;
+    }
+
+    let mut retire_setup_websocket = false;
+    if let StreamClientMessage::SetTransport(transport) = &message {
+        let requested = SelectedTransport::from(transport);
+        if let Some(selected) = *selected_transport {
+            if selected == requested {
+                // Transport creation is not idempotent in the child. Ignore a
+                // duplicate selection instead of recreating it in place.
+                return true;
+            }
+            warn!(
+                "[Stream]: refusing an in-place transport switch from {selected:?} to {requested:?}"
+            );
+            return false;
+        }
+
+        if requested == SelectedTransport::WebTransport {
+            let connected = match web_transport_bridge.as_ref() {
+                Some(bridge) => tokio::select! {
+                    result = timeout(
+                        WEB_TRANSPORT_SELECTION_TIMEOUT,
+                        wait_for_web_transport_connection(bridge.state.clone()),
+                    ) => result.unwrap_or(false),
+                    _ = forwarder_done_rx.recv() => false,
+                },
+                None => false,
+            };
+            if !connected {
+                warn!(
+                    "[Stream]: WebTransport was selected without a live bridge; ending the session"
+                );
+                return false;
+            }
+
+            let mut route = relay_route
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *route = RelayRoute::WebTransport;
+            control_session.clear_media();
+            // Disable this select branch in the same handoff step. Waiting for
+            // the peer's Close/EOF would let queued WS traffic starve lane 4.
+            *control_websocket_open = false;
+            retire_setup_websocket = true;
+        } else {
+            // A one-use bearer URL that will never be consumed should not
+            // remain valid until its TTL expires.
+            *web_transport_inbound = None;
+            *web_transport_state = None;
+            *web_transport_shutdown = None;
+            *web_transport_feedback = None;
+            if let Some(bridge) = web_transport_bridge.take() {
+                bridge.shutdown();
+            }
+        }
+        *selected_transport = Some(requested);
+    }
+
+    let starts_stream = matches!(&message, StreamClientMessage::StartStream { .. });
+    if !send_ipc_bounded(ipc_sender, ServerIpcMessage::WebSocket(message)).await {
+        warn!("[Stream]: streamer IPC stalled on a control message");
+        return false;
+    }
+    if starts_stream {
+        *stream_started = true;
+    }
+
+    if retire_setup_websocket {
+        // The authenticated WebSocket has completed its sole v4 job. Closing it
+        // here avoids intermediary idle handling; QUIC close/General Stop now
+        // own the active session lifetime.
+        let _ = control_session.close(None);
+    }
+    true
+}
+
 async fn send_ws_message(
     sender: &LowLatencySession,
     message: StreamServerMessage,
 ) -> Result<(), Closed> {
-    let Some(json) = serialize_json(&message) else {
+    send_ws_message_now(sender, &message)
+}
+
+fn send_ws_message_now(
+    sender: &LowLatencySession,
+    message: &StreamServerMessage,
+) -> Result<(), Closed> {
+    let Some(json) = serialize_json(message) else {
         return Ok(());
     };
 
@@ -866,6 +1112,16 @@ async fn receive_web_transport_shutdown(
     Some(*receiver.borrow_and_update())
 }
 
+async fn receive_web_transport_feedback(
+    receiver: &mut Option<watch::Receiver<NetworkFeedback>>,
+) -> Option<NetworkFeedback> {
+    let Some(receiver) = receiver else {
+        return std::future::pending().await;
+    };
+    receiver.changed().await.ok()?;
+    Some(*receiver.borrow_and_update())
+}
+
 async fn wait_for_web_transport_connection(
     mut receiver: watch::Receiver<WebTransportConnectionState>,
 ) -> bool {
@@ -912,6 +1168,25 @@ pub async fn cancel_host(
 mod tests {
     use super::*;
     use actix_web::test::TestRequest;
+    use common::api_bindings::StreamSettings;
+
+    fn start_stream_message() -> StreamClientMessage {
+        StreamClientMessage::StartStream {
+            settings: StreamSettings {
+                bitrate_kbps: 10_000,
+                adaptive_bitrate: true,
+                minimum_bitrate_kbps: 2_000,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                play_audio_local: false,
+                encrypt_host_video: true,
+                encrypt_host_audio: true,
+                supported_codecs: 1,
+                hdr: false,
+            },
+        }
+    }
 
     #[test]
     fn web_transport_requires_exactly_one_control_origin() {
@@ -931,5 +1206,131 @@ mod tests {
             .append_header((header::ORIGIN, "https://evil.test"))
             .to_http_request();
         assert_eq!(single_origin_header(&ambiguous), None);
+    }
+
+    #[test]
+    fn stream_control_encoding_is_channel_prefixed_and_bounded() {
+        let frame = encode_stream_control_message(&StreamServerMessage::ConnectionTerminated {
+            error_code: 42,
+        })
+        .unwrap();
+        assert_eq!(frame.first(), Some(&TransportChannelId::STREAM_CONTROL));
+        assert!(matches!(
+            serde_json::from_slice::<StreamServerMessage>(&frame[1..]),
+            Ok(StreamServerMessage::ConnectionTerminated { error_code: 42 })
+        ));
+
+        assert!(
+            encode_stream_control_message(&StreamServerMessage::DebugLog {
+                message: "x".repeat(MAX_STREAM_CONTROL_JSON_BYTES),
+                ty: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stream_control_decoding_rejects_malformed_and_accepts_the_exact_limit() {
+        let json = br#"{"SetTransport":"WebTransport"}"#;
+        let mut valid = vec![TransportChannelId::STREAM_CONTROL];
+        valid.extend_from_slice(json);
+        assert!(matches!(
+            decode_stream_control_message(&valid),
+            Some(StreamClientMessage::SetTransport(
+                TransportType::WebTransport
+            ))
+        ));
+
+        assert!(decode_stream_control_message(&[TransportChannelId::STREAM_CONTROL]).is_none());
+        assert!(
+            decode_stream_control_message(&[TransportChannelId::GENERAL, b'{', b'}']).is_none()
+        );
+        assert!(
+            decode_stream_control_message(&[TransportChannelId::STREAM_CONTROL, 0xff]).is_none()
+        );
+        assert!(
+            decode_stream_control_message(&[TransportChannelId::STREAM_CONTROL, b'{']).is_none()
+        );
+
+        let mut exact = vec![TransportChannelId::STREAM_CONTROL];
+        exact.extend_from_slice(json);
+        exact.resize(MAX_STREAM_CONTROL_JSON_BYTES + 1, b' ');
+        assert!(decode_stream_control_message(&exact).is_some());
+        exact.push(b' ');
+        assert!(decode_stream_control_message(&exact).is_none());
+    }
+
+    #[test]
+    fn stream_control_allowlist_requires_wt_selection_and_rejects_replay() {
+        let select_wt = StreamClientMessage::SetTransport(TransportType::WebTransport);
+        let select_ws = StreamClientMessage::SetTransport(TransportType::WebSocket);
+        let init = StreamClientMessage::Init {
+            host_id: 1,
+            app_id: 2,
+            video_frame_queue_size: 3,
+            audio_sample_queue_size: 4,
+        };
+        let start = start_stream_message();
+
+        assert!(!stream_control_allowed(
+            ControlSource::WebSocket,
+            &select_wt,
+            None,
+            false,
+        ));
+        assert!(stream_control_allowed(
+            ControlSource::WebTransport,
+            &select_wt,
+            None,
+            false,
+        ));
+        assert!(stream_control_allowed(
+            ControlSource::WebTransport,
+            &select_wt,
+            Some(SelectedTransport::WebTransport),
+            true,
+        ));
+        assert!(!stream_control_allowed(
+            ControlSource::WebTransport,
+            &start,
+            None,
+            false,
+        ));
+        assert!(stream_control_allowed(
+            ControlSource::WebTransport,
+            &start,
+            Some(SelectedTransport::WebTransport),
+            false,
+        ));
+        assert!(!stream_control_allowed(
+            ControlSource::WebTransport,
+            &start,
+            Some(SelectedTransport::WebTransport),
+            true,
+        ));
+        assert!(!stream_control_allowed(
+            ControlSource::WebTransport,
+            &init,
+            Some(SelectedTransport::WebTransport),
+            false,
+        ));
+        assert!(!stream_control_allowed(
+            ControlSource::WebTransport,
+            &select_ws,
+            Some(SelectedTransport::WebTransport),
+            false,
+        ));
+        assert!(stream_control_allowed(
+            ControlSource::WebSocket,
+            &start,
+            Some(SelectedTransport::WebSocket),
+            false,
+        ));
+        assert!(!stream_control_allowed(
+            ControlSource::WebSocket,
+            &start,
+            Some(SelectedTransport::WebSocket),
+            true,
+        ));
     }
 }

@@ -51,6 +51,20 @@ pub struct StreamerConfig {
     pub log_level: LevelFilter,
 }
 
+/// Coalesced, cumulative congestion telemetry from the browser-facing QUIC
+/// connection. The streamer uses deltas between snapshots to make bitrate
+/// decisions without putting feedback on the latency-sensitive input lane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkFeedback {
+    pub rtt_ms: u32,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub admission_drops: u64,
+    pub video_write_timeouts: u64,
+    pub recovery_requests: u64,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerIpcMessage {
@@ -69,6 +83,7 @@ pub enum ServerIpcMessage {
     },
     WebSocket(StreamClientMessage),
     WebSocketTransport(Bytes),
+    NetworkFeedback(NetworkFeedback),
     Stop,
 }
 
@@ -80,13 +95,13 @@ pub enum StreamerIpcMessage {
 }
 
 #[derive(Debug)]
-struct LowPrioritySlot<Message> {
+struct PendingSlot<Message> {
     message: StdMutex<Option<Message>>,
     notify: Notify,
     writer_closed: AtomicBool,
 }
 
-impl<Message> LowPrioritySlot<Message> {
+impl<Message> PendingSlot<Message> {
     fn new() -> Self {
         Self {
             message: StdMutex::new(None),
@@ -103,7 +118,7 @@ impl<Message> LowPrioritySlot<Message> {
     }
 
     fn close(&self) {
-        // Serialize closure with low-priority insertion. Once close returns, a
+        // Serialize closure with slot insertion. Once close returns, a
         // concurrent sender cannot pass its second closed check and publish an
         // undrainable message after the IPC writer has exited.
         let mut message = self
@@ -119,24 +134,28 @@ impl<Message> LowPrioritySlot<Message> {
 struct IpcQueues<Message> {
     reliable: Receiver<Message>,
     realtime: Receiver<Message>,
-    low_priority: Arc<LowPrioritySlot<Message>>,
+    latest: Arc<PendingSlot<Message>>,
+    low_priority: Arc<PendingSlot<Message>>,
 }
 
 fn priority_channel<Message>(span: Span) -> (IpcSender<Message>, IpcQueues<Message>) {
     let (reliable_sender, reliable) = channel(IPC_RELIABLE_QUEUE_CAPACITY);
     let (realtime_sender, realtime) = channel(IPC_REALTIME_QUEUE_CAPACITY);
-    let low_priority = Arc::new(LowPrioritySlot::new());
+    let latest = Arc::new(PendingSlot::new());
+    let low_priority = Arc::new(PendingSlot::new());
 
     (
         IpcSender {
             reliable_sender,
             realtime_sender,
+            latest: latest.clone(),
             low_priority: low_priority.clone(),
             span,
         },
         IpcQueues {
             reliable,
             realtime,
+            latest,
             low_priority,
         },
     )
@@ -276,21 +295,26 @@ async fn ipc_sender<Message>(
         }
     }
 
-    // Close both bounded queues and the low-priority slot together so every
+    // Close both bounded queues and both single-value slots together so every
     // sending API observes the same terminal state after an IPC write failure.
     queues.reliable.close();
     queues.realtime.close();
+    queues.latest.close();
     queues.low_priority.close();
 }
 
 async fn next_ipc_message<Message>(queues: &mut IpcQueues<Message>) -> Option<Message> {
     loop {
         // Explicit polling plus a biased select makes ordering deterministic:
-        // reliable control first, short-lived audio second, queued video last.
+        // reliable control first, short-lived realtime data second, the latest
+        // coalesced snapshot third, and queued video last.
         if let Ok(message) = queues.reliable.try_recv() {
             return Some(message);
         }
         if let Ok(message) = queues.realtime.try_recv() {
+            return Some(message);
+        }
+        if let Some(message) = queues.latest.take() {
             return Some(message);
         }
         if let Some(message) = queues.low_priority.take() {
@@ -315,6 +339,9 @@ async fn next_ipc_message<Message>(queues: &mut IpcQueues<Message>) -> Option<Me
                     return Some(message);
                 }
             }
+            _ = queues.latest.notify.notified() => {
+                // Loop back so reliable and realtime messages retain priority.
+            }
             _ = queues.low_priority.notify.notified() => {
                 // Loop back through the priority checks. A reliable message may
                 // have arrived at the same time as this notification.
@@ -327,7 +354,8 @@ async fn next_ipc_message<Message>(queues: &mut IpcQueues<Message>) -> Option<Me
 pub struct IpcSender<Message> {
     reliable_sender: Sender<Message>,
     realtime_sender: Sender<Message>,
-    low_priority: Arc<LowPrioritySlot<Message>>,
+    latest: Arc<PendingSlot<Message>>,
+    low_priority: Arc<PendingSlot<Message>>,
     span: Span,
 }
 
@@ -336,6 +364,7 @@ impl<Message> Clone for IpcSender<Message> {
         Self {
             reliable_sender: self.reliable_sender.clone(),
             realtime_sender: self.realtime_sender.clone(),
+            latest: self.latest.clone(),
             low_priority: self.low_priority.clone(),
             span: self.span.clone(),
         }
@@ -377,6 +406,29 @@ where
         self.realtime_sender.try_send(message)
     }
 
+    /// Publish replaceable state such as cumulative network feedback. Exactly
+    /// one unsent value is retained across the IPC boundary; a newer publish
+    /// atomically replaces an older one instead of replaying a stale backlog
+    /// after the child process catches up.
+    pub fn try_send_latest(&self, message: Message) -> Result<(), TrySendError<Message>> {
+        if self.latest.writer_closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed(message));
+        }
+
+        let mut slot = self
+            .latest
+            .message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.latest.writer_closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed(message));
+        }
+        *slot = Some(message);
+        drop(slot);
+        self.latest.notify.notify_one();
+        Ok(())
+    }
+
     /// Attempt to enqueue disposable bulk data such as an encoded video frame.
     /// There is exactly one low-priority slot, so video can never crowd reliable
     /// or realtime queues. Returning Full lets the video sender enter GOP-safe
@@ -404,7 +456,9 @@ where
     }
 
     pub fn is_closed(&self) -> bool {
-        self.reliable_sender.is_closed() || self.low_priority.writer_closed.load(Ordering::Acquire)
+        self.reliable_sender.is_closed()
+            || self.latest.writer_closed.load(Ordering::Acquire)
+            || self.low_priority.writer_closed.load(Ordering::Acquire)
     }
 }
 
@@ -495,6 +549,7 @@ mod tests {
     enum PriorityMessage {
         Control(u8),
         Audio(u8),
+        Feedback(u8),
         Video(u8),
     }
 
@@ -535,6 +590,26 @@ mod tests {
             Some(StreamerIpcMessage::WebSocketTransport(actual)) => {
                 assert_eq!(actual, expected);
             }
+            _ => panic!("unexpected decoded IPC message"),
+        }
+    }
+
+    #[test]
+    fn network_feedback_round_trips_through_binary_ipc() {
+        let expected = NetworkFeedback {
+            rtt_ms: 47,
+            sent_packets: 10_000,
+            lost_packets: 23,
+            congestion_events: 4,
+            admission_drops: 7,
+            video_write_timeouts: 2,
+            recovery_requests: 3,
+        };
+        let frame = encode_frame(&ServerIpcMessage::NetworkFeedback(expected));
+        let mut receiver = receiver::<ServerIpcMessage>(frame);
+
+        match runtime().block_on(receiver.recv()) {
+            Some(ServerIpcMessage::NetworkFeedback(actual)) => assert_eq!(actual, expected),
             _ => panic!("unexpected decoded IPC message"),
         }
     }
@@ -586,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_is_reliable_then_realtime_then_low_priority() {
+    fn priority_order_preserves_control_realtime_latest_and_video_lanes() {
         let (sender, mut queues) = priority_channel(Span::none());
 
         sender
@@ -600,17 +675,24 @@ mod tests {
             .try_send_realtime(PriorityMessage::Audio(3))
             .expect("audio should fit independently of video");
         sender
-            .try_send(PriorityMessage::Control(4))
+            .try_send_latest(PriorityMessage::Feedback(4))
+            .expect("latest-value feedback should fit independently of media");
+        sender
+            .try_send(PriorityMessage::Control(5))
             .expect("control should fit independently of media");
 
         runtime().block_on(async {
             assert_eq!(
                 next_ipc_message(&mut queues).await,
-                Some(PriorityMessage::Control(4))
+                Some(PriorityMessage::Control(5))
             );
             assert_eq!(
                 next_ipc_message(&mut queues).await,
                 Some(PriorityMessage::Audio(3))
+            );
+            assert_eq!(
+                next_ipc_message(&mut queues).await,
+                Some(PriorityMessage::Feedback(4))
             );
             assert_eq!(
                 next_ipc_message(&mut queues).await,
@@ -629,7 +711,10 @@ mod tests {
             .try_send_realtime(PriorityMessage::Audio(2))
             .expect("audio should fit");
         sender
-            .try_send(PriorityMessage::Control(3))
+            .try_send_latest(PriorityMessage::Feedback(3))
+            .expect("feedback should fit");
+        sender
+            .try_send(PriorityMessage::Control(4))
             .expect("control should fit");
         drop(sender);
 
@@ -644,9 +729,37 @@ mod tests {
                 span: Span::none(),
             };
 
-            assert_eq!(receiver.recv().await, Some(PriorityMessage::Control(3)));
+            assert_eq!(receiver.recv().await, Some(PriorityMessage::Control(4)));
             assert_eq!(receiver.recv().await, Some(PriorityMessage::Audio(2)));
+            assert_eq!(receiver.recv().await, Some(PriorityMessage::Feedback(3)));
             assert_eq!(receiver.recv().await, Some(PriorityMessage::Video(1)));
+            assert!(receiver.recv().await.is_none());
+            writer.await.expect("IPC writer task should finish cleanly");
+        });
+    }
+
+    #[test]
+    fn latest_value_is_coalesced_before_crossing_the_ipc_boundary() {
+        let (sender, queues) = priority_channel(Span::none());
+        for value in 1..=100 {
+            sender
+                .try_send_latest(PriorityMessage::Feedback(value))
+                .expect("latest-value slot should replace without filling");
+        }
+        drop(sender);
+
+        runtime().block_on(async move {
+            let (read, write) = tokio::io::duplex(1_024);
+            let writer = tokio::spawn(ipc_sender(Span::none(), write, queues));
+            let mut receiver = IpcReceiver::<PriorityMessage> {
+                errored: false,
+                read: create_reader(read),
+                encoded: Vec::new(),
+                phantom: PhantomData,
+                span: Span::none(),
+            };
+
+            assert_eq!(receiver.recv().await, Some(PriorityMessage::Feedback(100)));
             assert!(receiver.recv().await.is_none());
             writer.await.expect("IPC writer task should finish cleanly");
         });
@@ -689,6 +802,22 @@ mod tests {
         assert!(matches!(
             sender.try_send_low_priority(PriorityMessage::Video(2)),
             Err(TrySendError::Closed(PriorityMessage::Video(2)))
+        ));
+    }
+
+    #[test]
+    fn closure_rejects_latest_value_and_clears_pending_feedback() {
+        let (sender, queues) = priority_channel(Span::none());
+        sender
+            .try_send_latest(PriorityMessage::Feedback(1))
+            .expect("feedback should initially fit");
+
+        queues.latest.close();
+
+        assert!(queues.latest.take().is_none());
+        assert!(matches!(
+            sender.try_send_latest(PriorityMessage::Feedback(2)),
+            Err(TrySendError::Closed(PriorityMessage::Feedback(2)))
         ));
     }
 

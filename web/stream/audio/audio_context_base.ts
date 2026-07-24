@@ -26,6 +26,15 @@ export abstract class AudioContextBasePipe implements NodeAudioPlayer {
     }
 
     setup(setup: AudioPlayerSetup) {
+        // Adaptive bitrate changes reconnect the native media session while the
+        // browser pipeline stays alive. Release the previous context before
+        // replacing it so every reconnect does not leave an audio device and
+        // rendering graph running in the background.
+        if (this.audioContext) {
+            void this.audioContext.close()
+            this.audioContext = null
+        }
+
         try {
             this.audioContext = new AudioContext({
                 latencyHint: "interactive",

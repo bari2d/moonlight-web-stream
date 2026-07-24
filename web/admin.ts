@@ -8,7 +8,7 @@ import { UserList } from "./component/user/list.js";
 import { AddUserModal } from "./component/user/add_modal.js";
 import { showMessage, showModal } from "./component/modal/index.js";
 import { buildUrl } from "./config_.js";
-import { DetailedUserPage } from "./component/user/detailed_page.js";
+import { DetailedUserPage, DetailedUserPageEventListener } from "./component/user/detailed_page.js";
 import { User, UserEventListener } from "./component/user/index.js";
 import { DetailedRole, DetailedUser } from "./api_bindings.js";
 import { Role, RoleEventListener } from "./component/roles/index.js";
@@ -76,10 +76,19 @@ async function checkPermissions(api: Api) {
 
 type AppState = { tab: "users", user_id: number | null } |
 { tab: "roles", role_id: number | null }
+type DeletedUserComponent = User | DetailedUserPage
+type UserDeletedEventListener = (event: ComponentEvent<DeletedUserComponent>) => void
 function pushAppState(state: AppState, pushHistory: boolean) {
     if (pushHistory) {
         history.pushState(state, "")
     }
+
+    if (sessionStorage) {
+        sessionStorage.setItem("mlAdminState", JSON.stringify(state))
+    }
+}
+function replaceAppState(state: AppState) {
+    history.replaceState(state, "")
 
     if (sessionStorage) {
         sessionStorage.setItem("mlAdminState", JSON.stringify(state))
@@ -119,6 +128,23 @@ class AdminApp implements Component {
     // The actual content of the tabs
     private users: UserPanel | null = null
     private roles: RolePanel | null = null
+
+    private readonly onSelectedUserChanged = (event: ComponentEvent<User>) => {
+        const state: AppState = { tab: "users", user_id: event.component.getUserId() }
+        this.currentState = state
+        pushAppState(state, true)
+    }
+    private readonly onSelectedUserDeleted: UserDeletedEventListener = event => {
+        if (this.currentState?.tab != "users" || this.currentState.user_id != event.component.getUserId()) {
+            return
+        }
+
+        const state: AppState = { tab: "users", user_id: null }
+        this.currentState = state
+        // The selected user's history entry and session copy must not survive the
+        // deletion, otherwise reload/back immediately requests an ID that no longer exists.
+        replaceAppState(state)
+    }
 
     constructor(api: Api) {
         this.api = api
@@ -195,9 +221,8 @@ class AdminApp implements Component {
             if (state.tab == "users") {
                 if (!this.users) {
                     this.users = new UserPanel(this.api)
-                    this.users.addUserChangedListener(event => {
-                        pushAppState({ tab: "users", user_id: event.component.getUserId() }, true)
-                    })
+                    this.users.addUserChangedListener(this.onSelectedUserChanged)
+                    this.users.addUserDeletedListener(this.onSelectedUserDeleted)
                 }
 
                 this.users.mount(this.content)
@@ -218,7 +243,7 @@ class AdminApp implements Component {
 
         // Change the content (e.g. user / role) of the tab
         this.currentState = state
-        if (state.tab == "users" && state.user_id != null) {
+        if (state.tab == "users") {
             this.users?.setUserId(state.user_id)
         } else if (state.tab == "roles" && state.role_id != null) {
             this.roles?.setRoleId(state.role_id)
@@ -246,8 +271,18 @@ class UserPanel implements Component {
     private addUserButton = document.createElement("button")
     private userSearch = document.createElement("input")
     private userList: UserList
+    private deletedEventTarget = new EventTarget()
 
     private userInfoPage: DetailedUserPage | null = null
+    private selectedUserId: number | null = null
+    private userRequestGeneration = 0
+
+    private readonly userSearchChangeListener = () => this.onUserSearchChange()
+    private readonly userClickedListener = (event: ComponentEvent<User>) => {
+        void this.onUserClicked(event)
+    }
+    private readonly userListDeletedListener = (event: ComponentEvent<User>) => this.onUserDeleted(event.component)
+    private readonly detailedUserDeletedListener: DetailedUserPageEventListener = event => this.onUserDeleted(event.component)
 
     constructor(api: Api) {
         this.api = api
@@ -284,21 +319,24 @@ class UserPanel implements Component {
 
         this.userSearch.placeholder = I.admin.searchUser
         this.userSearch.type = "text"
-        this.userSearch.addEventListener("input", this.onUserSearchChange.bind(this))
+        this.userSearch.addEventListener("input", this.userSearchChangeListener)
         this.userPanel.appendChild(this.userSearch)
 
         this.userList = new UserList(api)
-        this.userList.addUserClickedListener(this.onUserClicked.bind(this))
-        this.userList.addUserDeletedListener(this.onUserDeleted.bind(this))
+        this.userList.addUserClickedListener(this.userClickedListener)
+        this.userList.addUserDeletedListener(this.userListDeletedListener)
         this.userList.mount(this.userPanel)
     }
 
     addUserChangedListener(listener: UserEventListener) {
         this.userList.addUserClickedListener(listener)
     }
+    addUserDeletedListener(listener: UserDeletedEventListener) {
+        this.deletedEventTarget.addEventListener("ml-userdeleted", listener as EventListener)
+    }
 
     getCurrentUserId(): number | null {
-        return this.userInfoPage?.getUserId() ?? null
+        return this.selectedUserId
     }
 
     async forceFetch() {
@@ -312,33 +350,65 @@ class UserPanel implements Component {
     private async onUserClicked(event: ComponentEvent<User>) {
         await this.setUserId(event.component.getUserId())
     }
-    async setUserId(userId: number) {
-        const user = await apiGetUser(this.api, {
-            user_id: userId,
-            name: null
-        })
+    async setUserId(userId: number | null) {
+        const requestGeneration = ++this.userRequestGeneration
+        this.selectedUserId = userId
 
-        this.setUserInfo(user)
+        if (userId == null) {
+            this.setUserInfo(null)
+            return
+        }
+
+        // Do not leave another user's editable form on screen while this request runs.
+        if (this.userInfoPage?.getUserId() != userId) {
+            this.setUserInfo(null)
+        }
+
+        try {
+            const user = await apiGetUser(this.api, {
+                user_id: userId,
+                name: null
+            })
+
+            // A slower response for user A must not replace user B after B was selected.
+            if (requestGeneration == this.userRequestGeneration && this.selectedUserId == userId) {
+                this.setUserInfo(user)
+            }
+        } catch (error) {
+            // Ignore failures from requests made obsolete by a newer selection/deletion.
+            if (requestGeneration == this.userRequestGeneration && this.selectedUserId == userId) {
+                throw error
+            }
+        }
     }
     private setUserInfo(user: DetailedUser | null) {
         if (this.userInfoPage) {
+            this.userInfoPage.removeDeletedListener(this.detailedUserDeletedListener)
             this.userInfoPage.unmount(this.rootDiv)
-            this.userInfoPage.removeDeletedListener(this.onUserDeleted.bind(this))
         }
 
         this.userInfoPage = null
         if (user) {
             this.userInfoPage = new DetailedUserPage(this.api, user)
-            this.userInfoPage.addDeletedListener(this.onUserDeleted.bind(this))
+            this.userInfoPage.addDeletedListener(this.detailedUserDeletedListener)
             this.userInfoPage.mount(this.rootDiv)
         }
     }
 
-    private onUserDeleted(event: ComponentEvent<User>) {
-        if (this.userInfoPage?.getUserId() == event.component.getUserId()) {
+    private onUserDeleted(component: DeletedUserComponent) {
+        const deletedUserId = component.getUserId()
+        if (this.selectedUserId == deletedUserId) {
+            ++this.userRequestGeneration
+            this.selectedUserId = null
+            this.setUserInfo(null)
+        } else if (this.userInfoPage?.getUserId() == deletedUserId) {
+            // A previous page can remain visible briefly while another user loads.
             this.setUserInfo(null)
         }
-        this.userList.removeUser(event.component.getUserId())
+        this.userList.removeUser(deletedUserId)
+        // Detail-page deletes do not originate from UserList, so forward both
+        // deletion sources through one panel-level event for AdminApp state cleanup.
+        this.deletedEventTarget.dispatchEvent(new ComponentEvent("ml-userdeleted", component))
     }
 
     mount(parent: HTMLElement): void {

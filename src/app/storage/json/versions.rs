@@ -13,6 +13,8 @@ use crate::app::user::RoleType;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "version")]
 pub enum Json {
+    #[serde(rename = "4")]
+    V4(V4),
     #[serde(rename = "3")]
     V3(V3),
     #[serde(rename = "2")]
@@ -185,6 +187,7 @@ fn migrate_v2_to_v3(old: V2) -> V3 {
                         client_unique_id: user.client_unique_id,
                         name: user.name,
                         password: user.password,
+                        settings: None,
                         role_id: match user.role {
                             RoleType::Admin => ADMIN_ID,
                             RoleType::User => USER_ID,
@@ -216,6 +219,35 @@ pub struct V3User {
     pub name: String,
     pub password: Option<V2UserPassword>,
     pub client_unique_id: String,
+    #[serde(default)]
+    pub settings: Option<Value>,
+}
+
+// V4 gives per-user settings their own storage version. V3 intentionally keeps
+// accepting the short-lived settings field so installations that already wrote
+// it before V4 was introduced migrate without losing those values.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V4 {
+    #[serde(deserialize_with = "de_int_key")]
+    pub users: HashMap<u32, V4User>,
+    #[serde(deserialize_with = "de_int_key")]
+    pub hosts: HashMap<u32, V2Host>,
+    #[serde(deserialize_with = "de_int_key")]
+    pub roles: HashMap<u32, V3Role>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V4User {
+    pub role_id: u32,
+    pub name: String,
+    pub password: Option<V2UserPassword>,
+    pub client_unique_id: String,
+    pub settings: Option<Value>,
+    #[serde(default)]
+    pub settings_revision: u64,
+    #[serde(default)]
+    pub settings_mutation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,10 +291,114 @@ impl Default for V3RolePermissions {
     }
 }
 
-pub fn migrate_to_latest(json: Json) -> Result<V3, anyhow::Error> {
+fn migrate_v3_to_v4(old: V3) -> V4 {
+    V4 {
+        users: old
+            .users
+            .into_iter()
+            .map(|(id, user)| {
+                (
+                    id,
+                    V4User {
+                        role_id: user.role_id,
+                        name: user.name,
+                        password: user.password,
+                        client_unique_id: user.client_unique_id,
+                        settings: user.settings,
+                        settings_revision: 0,
+                        settings_mutation_ids: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+        hosts: old.hosts,
+        roles: old.roles,
+    }
+}
+
+pub fn migrate_to_latest(json: Json) -> Result<V4, anyhow::Error> {
     match json {
-        Json::V1(v1) => Ok(migrate_v2_to_v3(migrate_v1_to_v2(v1))),
-        Json::V2(v2) => Ok(migrate_v2_to_v3(v2)),
-        Json::V3(v3) => Ok(v3),
+        Json::V1(v1) => Ok(migrate_v3_to_v4(migrate_v2_to_v3(migrate_v1_to_v2(v1)))),
+        Json::V2(v2) => Ok(migrate_v3_to_v4(migrate_v2_to_v3(v2))),
+        Json::V3(v3) => Ok(migrate_v3_to_v4(v3)),
+        Json::V4(v4) => Ok(v4),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Json, V3User, V4User, migrate_to_latest};
+
+    #[test]
+    fn v3_user_without_settings_deserializes_with_none() {
+        let user: V3User = serde_json::from_value(json!({
+            "role_id": 7,
+            "name": "legacy-user",
+            "password": null,
+            "client_unique_id": "legacy-client"
+        }))
+        .expect("an existing V3 user without settings should still deserialize");
+
+        assert!(user.settings.is_none());
+    }
+
+    #[test]
+    fn v3_with_interim_settings_migrates_to_v4_without_loss() {
+        let json: Json = serde_json::from_value(json!({
+            "version": "3",
+            "users": {
+                "7": {
+                    "role_id": 3,
+                    "name": "interim-user",
+                    "password": null,
+                    "client_unique_id": "interim-client",
+                    "settings": { "bitrate": 17_000 }
+                }
+            },
+            "hosts": {},
+            "roles": {}
+        }))
+        .expect("interim V3 settings should deserialize");
+
+        let v4 = migrate_to_latest(json).expect("V3 should migrate to V4");
+        assert_eq!(
+            v4.users
+                .get(&7)
+                .expect("migrated user should exist")
+                .settings,
+            Some(json!({ "bitrate": 17_000 }))
+        );
+        assert_eq!(
+            v4.users
+                .get(&7)
+                .expect("migrated user should exist")
+                .settings_revision,
+            0
+        );
+        assert!(
+            v4.users
+                .get(&7)
+                .expect("migrated user should exist")
+                .settings_mutation_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v4_user_without_revision_deserializes_with_zero() {
+        let user: V4User = serde_json::from_value(json!({
+            "role_id": 7,
+            "name": "pre-revision-user",
+            "password": null,
+            "client_unique_id": "pre-revision-client",
+            "settings": { "bitrate": 21_000 }
+        }))
+        .expect("an existing V4 user without a revision should still deserialize");
+
+        assert_eq!(user.settings_revision, 0);
+        assert_eq!(user.settings, Some(json!({ "bitrate": 21_000 })));
+        assert!(user.settings_mutation_ids.is_empty());
     }
 }

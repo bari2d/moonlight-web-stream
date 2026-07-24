@@ -70,6 +70,14 @@ export class AudioDecoderPipe implements DataAudioPlayer {
             this.base.setup(setup)
         }
 
+        // A controlled bitrate downshift restarts the Moonlight A/V session and
+        // sends Setup again over the existing browser transport. Start a fresh
+        // Opus timeline rather than carrying decoder state across generations.
+        if (this.decoder.state == "configured") {
+            this.decoder.reset()
+        }
+        this.errored = false
+        this.isFirstPacket = true
         this.decoder.configure({
             codec: "opus",
             numberOfChannels: setup.channels,

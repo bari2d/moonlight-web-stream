@@ -9,6 +9,7 @@ use crate::StreamConnection;
 
 pub(crate) struct StreamAudioDecoder {
     pub(crate) stream: Weak<StreamConnection>,
+    pub(crate) generation: u64,
 }
 
 impl AudioDecoder for StreamAudioDecoder {
@@ -17,13 +18,23 @@ impl AudioDecoder for StreamAudioDecoder {
             warn!("Failed to setup audio because stream is deallocated");
             return -1;
         };
+        if !stream.is_current_native_generation(self.generation) {
+            return 0;
+        }
 
         {
             let mut stream_info = stream.stream_setup.blocking_lock();
+            if !stream.is_current_native_generation(self.generation) {
+                return 0;
+            }
             stream_info.audio = Some(stream_config.clone());
         }
 
+        let generation = self.generation;
         stream.runtime.clone().block_on(async move {
+            if !stream.is_current_native_generation(generation) {
+                return 0;
+            }
             let sender = {
                 let sender = stream.transport_sender.lock().await;
                 sender.clone()
@@ -46,8 +57,15 @@ impl AudioDecoder for StreamAudioDecoder {
             warn!("Failed to send audio sample because stream is deallocated");
             return;
         };
+        if !stream.is_native_media_ready(self.generation) {
+            return;
+        }
 
+        let generation = self.generation;
         stream.runtime.clone().block_on(async move {
+            if !stream.is_native_media_ready(generation) {
+                return;
+            }
             let sender = {
                 let sender = stream.transport_sender.lock().await;
                 sender.clone()

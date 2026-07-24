@@ -40,7 +40,7 @@ async-trait = "0.1.89"
 tokio = { version = "1.47.1" }
 futures = "0.3.31"
 bytes = "1.11.1"
-wtransport = "0.7.1"
+wtransport = { version = "0.7.1", features = ["quinn"] }
 
 # -- Http / Https
 # other
@@ -92,7 +92,7 @@ default-run = "web-server"
 moonlight-common = { workspace = true }
 common = { workspace = true }
 
-tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "io-util"] }
 futures-concurrency = "7.7.1"
 
 clap = { workspace = true, features = ["derive", "env"] }
@@ -126,7 +126,10 @@ sha2 = "0.10.9"
 wtransport.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
 
 [lints]
 workspace = true

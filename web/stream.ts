@@ -1,28 +1,62 @@
 import "./polyfill/index.js"
-import { Api, apiGetRole, getApi } from "./api.js";
+import { Api, apiGetRole, apiGetUser, apiGetUserSettings, apiPatchUserSettings, getApi, isRetryableApiError } from "./api.js";
 import { Component } from "./component/index.js";
 import { showNotification } from "./component/notification.js";
 import { InfoEvent, Stream } from "./stream/index.js"
 import { getModalBackground, Modal, showMessage, showModal } from "./component/modal/index.js";
 import { getSidebarRoot, setSidebar, setSidebarExtended, setSidebarStyle, Sidebar } from "./component/sidebar/index.js";
 import { defaultStreamInputConfig, MouseMode, ScreenKeyboardSetVisibleEvent, StreamInputConfig } from "./stream/input.js";
-import { getLocalStreamSettings, Settings } from "./component/settings_menu.js";
+import { initializeUserStreamSettings, Settings } from "./component/settings_menu.js";
 import { SelectComponent } from "./component/input.js";
-import { DetailedRole, LogMessageType, StreamCapabilities, StreamKeys, StreamPermissions } from "./api_bindings.js";
+import { LogMessageType, StreamCapabilities, StreamKeys, StreamPermissions } from "./api_bindings.js";
 import { KeyboardModeEvent, KeyboardModeWillChangeEvent, ScreenKeyboard, TextEvent } from "./screen_keyboard.js";
 import { FormModal } from "./component/modal/form.js";
 import { streamStatsToText } from "./stream/stats.js";
-import { adoptRoleDefaultLanguage, getCurrentLanguage, getTranslations } from "./i18n.js";
+import { getCurrentLanguage, getTranslations, setCurrentLanguage } from "./i18n.js";
 import { requestKeyboardLock } from "./iframe.js";
+import { setStyle as setPageStyle } from "./styles/index.js";
 
 let I = getTranslations(getCurrentLanguage())
 
 async function startApp() {
     const api = await getApi()
 
-    const bootstrapRole = await apiGetRole(api, { id: null })
-    adoptRoleDefaultLanguage(bootstrapRole.role.default_settings)
+    const userSettingsRequest = apiGetUserSettings(api).then(
+        snapshot => ({ snapshot, error: undefined }),
+        error => ({ snapshot: undefined, error }),
+    )
+    const [user, bootstrapRole, userSettings] = await Promise.all([
+        apiGetUser(api),
+        apiGetRole(api, { id: null }),
+        userSettingsRequest,
+    ])
+    if (userSettings.snapshot && userSettings.snapshot.user_id !== user.id) {
+        window.location.reload()
+        return
+    }
+    const effectiveSettings = await initializeUserStreamSettings(
+        `${api.host_url}|${user.id}`,
+        bootstrapRole.role.default_settings,
+        userSettings.snapshot,
+        (settings, mutationId) => apiPatchUserSettings(api, user.id, settings, mutationId),
+        async () => {
+            const snapshot = await apiGetUserSettings(api)
+            if (snapshot.user_id !== user.id) {
+                throw new Error("The authenticated user changed while settings were loading")
+            }
+            return snapshot
+        },
+        isRetryableApiError,
+        () => showNotification(getTranslations(getCurrentLanguage()).index.saveSettingsFailed, "error"),
+    )
+    setCurrentLanguage(effectiveSettings.language)
     I = getTranslations(getCurrentLanguage())
+    setPageStyle(effectiveSettings.pageStyle)
+
+    if (userSettings.error !== undefined) {
+        console.error("Failed to load account settings; using the local cache", userSettings.error)
+        showNotification(I.index.saveSettingsFailed, "error")
+    }
 
     const rootElement = document.getElementById("root");
     if (rootElement == null) {
@@ -56,7 +90,7 @@ async function startApp() {
     }
 
     // Start and Mount App
-    const app = new ViewerApp(api, hostId, appId, bootstrapRole.role)
+    const app = new ViewerApp(api, hostId, appId, bootstrapRole.role.permissions, effectiveSettings)
     app.mount(rootElement);
 
     (window as any)["app"] = app
@@ -109,6 +143,7 @@ class ViewerApp implements Component {
     private streamMutationObserver: MutationObserver | null = null
     private readonly eventListenerAbort = new AbortController()
     private statsUpdateInterval: number | null = null
+    private lastStatsText = ""
     private touchUpdateFrame: number | null = null
     private gamepadUpdateFrame: number | null = null
     private animationLoopsActive = true
@@ -128,7 +163,7 @@ class ViewerApp implements Component {
         this.scheduleTouchUpdate()
     }
 
-    constructor(api: Api, hostId: number, appId: number, bootstrapRole: DetailedRole) {
+    constructor(api: Api, hostId: number, appId: number, permissions: StreamPermissions, settings: Settings) {
         this.api = api
 
         const inputElement = document.getElementById("input")
@@ -137,7 +172,6 @@ class ViewerApp implements Component {
         }
         this.inputElement = inputElement
 
-        const settings = getLocalStreamSettings(bootstrapRole.default_settings)
         Object.assign(this.inputConfig, {
             mouseMode: settings.mouseMode,
             mouseScrollMode: settings.mouseScrollMode,
@@ -157,17 +191,20 @@ class ViewerApp implements Component {
         this.localTouchCursorDiv.classList.add("local-touch-cursor")
 
         this.statsUpdateInterval = window.setInterval(() => {
-            // Update stats display every 100ms
             const stats = this.getStream()?.getStats()
             if (stats && stats.isEnabled()) {
                 this.statsDiv.hidden = false
 
-                const text = streamStatsToText(stats.getCurrentStats())
-                this.statsDiv.innerText = text
+                const text = streamStatsToText(stats.getCurrentStats(), stats.getMode())
+                if (text != this.lastStatsText) {
+                    this.statsDiv.innerText = text
+                    this.lastStatsText = text
+                }
             } else {
                 this.statsDiv.hidden = true
+                this.lastStatsText = ""
             }
-        }, 100)
+        }, 250)
         this.div.appendChild(this.statsDiv)
         this.div.appendChild(this.localTouchCursorDiv)
 
@@ -180,8 +217,8 @@ class ViewerApp implements Component {
         this.autoEnterFullscreenOnStart = settings.enterFullscreenOnStreamStart
         this.toggleFullscreenWithKeybind = settings.toggleFullscreenWithKeybind
 
-        this.stream = new Stream(this.api, hostId, appId, settings, [browserWidth, browserHeight], bootstrapRole.permissions)
-        this.startStream(hostId, appId, bootstrapRole.permissions, settings, [browserWidth, browserHeight])
+        this.stream = new Stream(this.api, hostId, appId, settings, [browserWidth, browserHeight], permissions)
+        this.startStream(hostId, appId, permissions, settings, [browserWidth, browserHeight])
         this.initializeStreamRectCache()
 
         // Configure input
@@ -1341,10 +1378,14 @@ class ViewerSidebar implements Component, Sidebar {
 
         // Stats
         this.statsButton.innerText = I.stream.stats
+        this.statsButton.title = "Cycles Off → Compact → Advanced → Off"
         this.statsButton.addEventListener("click", () => {
             const stats = this.app.getStream()?.getStats()
             if (stats) {
-                stats.toggle()
+                const mode = stats.toggle()
+                this.statsButton.innerText = mode == "off"
+                    ? I.stream.stats
+                    : `${I.stream.stats}: ${mode == "compact" ? "Compact" : "Advanced"}`
             }
         })
         this.buttonDiv.appendChild(this.statsButton)

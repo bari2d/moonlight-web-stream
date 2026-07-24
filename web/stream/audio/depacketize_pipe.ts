@@ -27,7 +27,11 @@ export class DepacketizeAudioPipe implements DataPipe {
     }
 
     setup(setup: AudioPlayerSetup) {
-        this.packetDurationMicroseconds = setup.samplesPerFrame * 1_000_000 / setup.sampleRate
+        const packetDurationMicroseconds = setup.samplesPerFrame * 1_000_000 / setup.sampleRate
+        this.packetDurationMicroseconds = Number.isFinite(packetDurationMicroseconds) && packetDurationMicroseconds > 0
+            ? packetDurationMicroseconds
+            : 1
+        this.timestampMicroseconds = 0
 
         if ("setup" in this.base && typeof this.base.setup == "function") {
             return this.base.setup(...arguments)
@@ -35,13 +39,18 @@ export class DepacketizeAudioPipe implements DataPipe {
     }
 
     submitPacket(buffer: ArrayBuffer) {
+        const timestampMicroseconds = Math.round(this.timestampMicroseconds)
+        this.timestampMicroseconds += this.packetDurationMicroseconds
+        const nextTimestampMicroseconds = Math.max(
+            timestampMicroseconds + 1,
+            Math.round(this.timestampMicroseconds),
+        )
+
         this.base.decodeAndPlay({
             data: buffer,
-            timestampMicroseconds: 0,
-            durationMicroseconds: 0,
+            timestampMicroseconds,
+            durationMicroseconds: nextTimestampMicroseconds - timestampMicroseconds,
         })
-
-        this.timestampMicroseconds += this.packetDurationMicroseconds
     }
 
     getBase(): Pipe | null {

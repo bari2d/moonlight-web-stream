@@ -19,6 +19,8 @@ const locales: Record<Language, Translations> = {
     "ko-KR": koKR,
 }
 
+let currentLanguageOverride: Language | null = null
+
 export function getTranslations(language: Language): Translations {
     return locales[language]
 }
@@ -29,6 +31,9 @@ export function normalizeLanguage(language: unknown): Language {
     }
     if (language === "pt" || language === "pt-BR" || language === "pt_BR") {
         return "pt-BR"
+    }
+    if (language === "fr" || language === "fr-FR" || language === "fr_FR") {
+        return "fr-FR"
     }
     if (language === "ko" || language === "ko-KR" || language === "ko_KR") {
         return "ko-KR"
@@ -46,7 +51,13 @@ function getStoredSettings(): Record<string, unknown> | null {
 }
 
 export function getCurrentLanguage(): Language {
-    return normalizeLanguage(getStoredSettings()?.language)
+    return currentLanguageOverride ?? normalizeLanguage(getStoredSettings()?.language)
+}
+
+export function setCurrentLanguage(language: unknown): Language {
+    currentLanguageOverride = normalizeLanguage(language)
+    document.documentElement.lang = currentLanguageOverride
+    return currentLanguageOverride
 }
 
 export function hasStoredLanguage(): boolean {

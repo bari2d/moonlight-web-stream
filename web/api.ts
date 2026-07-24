@@ -87,6 +87,18 @@ export type ApiFetchInit = {
     json?: any,
     query?: any,
     noTimeout?: boolean,
+    keepalive?: boolean,
+}
+
+export type UserSettings = Record<string, unknown>
+export type UserSettingsSnapshot = {
+    user_id: number,
+    settings: UserSettings | null,
+    revision: number,
+}
+export type UserSettingsSaveResult = {
+    revision: number,
+    applied: boolean,
 }
 
 export function isDetailedHost(host: UndetailedHost | DetailedHost): host is DetailedHost {
@@ -123,7 +135,8 @@ function buildRequest(api: Api, endpoint: string, method: string, init?: ApiFetc
         method: method,
         headers,
         body: init?.json && JSON.stringify(init.json),
-        credentials: "include"
+        credentials: "include",
+        keepalive: init?.keepalive,
     }
 
     return [url, request]
@@ -300,9 +313,66 @@ export async function apiGetUser(api: Api, query?: GetUserQuery): Promise<Detail
 
     const response = await fetchApi(api, "/user", GET, {
         query: query ?? { name: null, user_id: null }
-    })
+    }) as DetailedUser
 
-    return response as DetailedUser
+    return response
+}
+
+export function isRetryableApiError(error: unknown): boolean {
+    if (!(error instanceof FetchError)) {
+        return false
+    }
+    const status = error.getResponse()?.status
+    return status === undefined
+        || status === 408
+        || status === 425
+        || status === 429
+        || status >= 500
+}
+
+export async function apiGetUserSettings(api: Api): Promise<UserSettingsSnapshot> {
+    const response = await fetchApi(api, "/settings/user", GET)
+    if (
+        response === null
+        || typeof response !== "object"
+        || Array.isArray(response)
+        || !Number.isSafeInteger(response.user_id)
+        || response.user_id < 0
+        || (response.settings !== null
+            && (typeof response.settings !== "object" || Array.isArray(response.settings)))
+        || !Number.isSafeInteger(response.revision)
+        || response.revision < 0
+    ) {
+        throw new Error("The server returned invalid user settings")
+    }
+
+    return response as UserSettingsSnapshot
+}
+export async function apiPatchUserSettings(
+    api: Api,
+    userId: number,
+    settings: UserSettings,
+    mutationId: string,
+): Promise<UserSettingsSaveResult> {
+    const response = await fetchApi(api, "/settings/user", PATCH, {
+        json: {
+            user_id: userId,
+            mutation_id: mutationId,
+            settings,
+        },
+        keepalive: true,
+    })
+    if (
+        response === null
+        || typeof response !== "object"
+        || Array.isArray(response)
+        || !Number.isSafeInteger(response.revision)
+        || response.revision < 0
+        || typeof response.applied !== "boolean"
+    ) {
+        throw new Error("The server returned an invalid settings save result")
+    }
+    return response as UserSettingsSaveResult
 }
 export async function apiGetUsers(api: Api): Promise<GetUsersResponse> {
     const response = await fetchApi(api, "/users", GET)

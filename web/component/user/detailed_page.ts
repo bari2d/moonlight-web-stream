@@ -4,8 +4,10 @@ import { DetailedUser, PatchUserRequest } from "../../api_bindings.js";
 import { getCurrentLanguage, getTranslations } from "../../i18n.js";
 import { InputComponent, SelectComponent } from "../input.js";
 import { createSelectRoleInput } from "./role_select.js";
-import { tryDeleteUser, UserEventListener } from "./index.js";
+import { tryDeleteUser } from "./index.js";
 import { showNotification } from "../notification.js";
+
+export type DetailedUserPageEventListener = (event: ComponentEvent<DetailedUserPage>) => void
 
 export class DetailedUserPage implements Component {
 
@@ -23,6 +25,17 @@ export class DetailedUserPage implements Component {
 
     private applyButton = document.createElement("button")
     private deleteButton = document.createElement("button")
+
+    private rolesLoaded = false
+    private saving = false
+    private disposed = false
+
+    private readonly deleteListener = () => {
+        void this.delete()
+    }
+    private readonly submitListener = (event: SubmitEvent) => {
+        void this.apply(event)
+    }
 
     constructor(api: Api, user: DetailedUser) {
         this.api = api
@@ -53,12 +66,25 @@ export class DetailedUserPage implements Component {
 
         this.role = createSelectRoleInput([], user.role_id)
         this.role.mount(this.formRoot)
-        apiGetRoles(api).then(roles => {
-            this.role.unmount(this.formRoot)
+        this.applyButton.disabled = true
+        apiGetRoles(api)
+            .then(roles => {
+                if (this.disposed) {
+                    return
+                }
 
-            this.role = createSelectRoleInput(roles.roles, user.role_id)
-            this.role.mountBefore(this.formRoot, this.clientUniqueId)
-        })
+                this.role.unmount(this.formRoot)
+
+                this.role = createSelectRoleInput(roles.roles, user.role_id)
+                this.role.mountBefore(this.formRoot, this.clientUniqueId)
+                this.rolesLoaded = true
+                this.updateButtonState()
+            })
+            .catch(error => {
+                if (!this.disposed) {
+                    showNotification(i.rolesLoadFailed, "error", error)
+                }
+            })
 
         this.clientUniqueId = new InputComponent("userClientUniqueId", "text", i.moonlightClientId, {
             defaultValue: user.client_unique_id,
@@ -69,18 +95,27 @@ export class DetailedUserPage implements Component {
         this.applyButton.type = "submit"
         this.formRoot.appendChild(this.applyButton)
 
-        this.deleteButton.addEventListener("click", this.delete.bind(this))
+        this.deleteButton.addEventListener("click", this.deleteListener)
         this.deleteButton.classList.add("user-info-delete")
         this.deleteButton.innerText = i.delete
         this.deleteButton.type = "button"
         this.formRoot.appendChild(this.deleteButton)
 
-        this.formRoot.addEventListener("submit", this.apply.bind(this))
+        this.formRoot.addEventListener("submit", this.submitListener)
+    }
+
+    private updateButtonState() {
+        this.applyButton.disabled = !this.rolesLoaded || this.saving
+        this.deleteButton.disabled = this.saving
     }
 
     private async apply(event: SubmitEvent) {
         event.preventDefault()
         const i = getTranslations(getCurrentLanguage()).admin
+
+        if (!this.rolesLoaded || this.saving) {
+            return
+        }
 
         let password = null
         if (this.password.isEnabled()) {
@@ -100,7 +135,28 @@ export class DetailedUserPage implements Component {
             client_unique_id: this.clientUniqueId.getValue()
         };
 
-        await apiPatchUser(this.api, request)
+        this.saving = true
+        this.updateButtonState()
+
+        try {
+            await apiPatchUser(this.api, request)
+
+            if (!this.disposed) {
+                // Do not accidentally resend a password on a later settings-only save.
+                this.password.reset()
+                this.password.setEnabled(false)
+                showNotification(i.userUpdated, "info")
+            }
+        } catch (error) {
+            if (!this.disposed) {
+                showNotification(i.userUpdateFailed, "error", error)
+            }
+        } finally {
+            this.saving = false
+            if (!this.disposed) {
+                this.updateButtonState()
+            }
+        }
     }
 
     private async delete() {
@@ -109,10 +165,10 @@ export class DetailedUserPage implements Component {
         this.formRoot.dispatchEvent(new ComponentEvent("ml-userdeleted", this))
     }
 
-    addDeletedListener(listener: UserEventListener, options?: EventListenerOptions) {
+    addDeletedListener(listener: DetailedUserPageEventListener, options?: EventListenerOptions) {
         this.formRoot.addEventListener("ml-userdeleted", listener as any, options)
     }
-    removeDeletedListener(listener: UserEventListener) {
+    removeDeletedListener(listener: DetailedUserPageEventListener) {
         this.formRoot.removeEventListener("ml-userdeleted", listener as any)
     }
 
@@ -124,6 +180,9 @@ export class DetailedUserPage implements Component {
         parent.appendChild(this.formRoot)
     }
     unmount(parent: HTMLElement): void {
+        this.disposed = true
+        this.deleteButton.removeEventListener("click", this.deleteListener)
+        this.formRoot.removeEventListener("submit", this.submitListener)
         parent.removeChild(this.formRoot)
     }
 }

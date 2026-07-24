@@ -669,6 +669,16 @@ input[type=number] {
     color: white;
 }
 
+.settings-warning {
+    margin: 0.5rem 0 1rem;
+    padding: 0.65rem 0.75rem;
+    border-left: 3px solid #ffb347;
+    border-radius: 4px;
+    background: rgba(255, 179, 71, 0.12);
+    line-height: 1.4;
+    font-size: 0.9rem;
+}
+
 /** Hosts */
 .host-add {
     background-color: transparent;

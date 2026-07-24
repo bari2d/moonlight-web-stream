@@ -1,5 +1,5 @@
 import "./polyfill/index.js"
-import { Api, getApi, apiPostHost, FetchError, apiLogout, apiGetUser, tryLogin, apiGetHost, apiGetRole, apiPatchRole } from "./api.js";
+import { Api, getApi, apiPostHost, FetchError, apiLogout, apiGetUser, tryLogin, apiGetHost, apiGetRole, apiPatchRole, apiGetUserSettings, apiPatchUserSettings, isRetryableApiError } from "./api.js";
 import { AddHostModal } from "./component/host/add_modal.js";
 import { HostList } from "./component/host/list.js";
 import { Component, ComponentEvent } from "./component/index.js";
@@ -9,8 +9,8 @@ import { setContextMenu } from "./component/context_menu.js";
 import { GameList } from "./component/game/list.js";
 import { Host } from "./component/host/index.js";
 import { App, DetailedRole, DetailedUser } from "./api_bindings.js";
-import { getLocalStreamSettings, globalDefaultSettings, setLocalStreamSettings, StreamSettingsComponent } from "./component/settings_menu.js";
-import { adoptRoleDefaultLanguage, getCurrentLanguage, getTranslations } from "./i18n.js";
+import { initializeUserStreamSettings, setLocalStreamSettings, Settings, StreamSettingsComponent } from "./component/settings_menu.js";
+import { getCurrentLanguage, getTranslations, setCurrentLanguage } from "./i18n.js";
 import { setTouchContextMenuEnabled } from "./polyfill/ios_right_click.js";
 import { buildUrl } from "./config_.js";
 import { setStyle as setPageStyle } from "./styles/index.js";
@@ -22,9 +22,45 @@ async function startApp() {
 
     const api = await getApi()
 
-    const bootstrapRole = await apiGetRole(api, { id: null })
-    adoptRoleDefaultLanguage(bootstrapRole.role.default_settings)
+    const userSettingsRequest = apiGetUserSettings(api).then(
+        snapshot => ({ snapshot, error: undefined }),
+        error => ({ snapshot: undefined, error }),
+    )
+    const [user, bootstrapRole, userSettings] = await Promise.all([
+        apiGetUser(api),
+        apiGetRole(api, { id: null }),
+        userSettingsRequest,
+    ])
+    if (userSettings.snapshot && userSettings.snapshot.user_id !== user.id) {
+        // Another tab changed the shared login while startup requests were in
+        // flight. Reload instead of ever caching one account under another.
+        window.location.reload()
+        return
+    }
+
+    const effectiveSettings = await initializeUserStreamSettings(
+        `${api.host_url}|${user.id}`,
+        bootstrapRole.role.default_settings,
+        userSettings.snapshot,
+        (settings, mutationId) => apiPatchUserSettings(api, user.id, settings, mutationId),
+        async () => {
+            const snapshot = await apiGetUserSettings(api)
+            if (snapshot.user_id !== user.id) {
+                throw new Error("The authenticated user changed while settings were loading")
+            }
+            return snapshot
+        },
+        isRetryableApiError,
+        () => showNotification(getTranslations(getCurrentLanguage()).index.saveSettingsFailed, "error"),
+    )
+    setCurrentLanguage(effectiveSettings.language)
     I = getTranslations(getCurrentLanguage())
+    setPageStyle(effectiveSettings.pageStyle)
+
+    if (userSettings.error !== undefined) {
+        console.error("Failed to load account settings; using the local cache", userSettings.error)
+        showNotification(I.index.saveSettingsFailed, "error")
+    }
 
     const rootElement = document.getElementById("root");
     if (rootElement == null) {
@@ -40,7 +76,7 @@ async function startApp() {
         }
     }
 
-    const app = new MainApp(api, bootstrapRole.role)
+    const app = new MainApp(api, user, bootstrapRole.role, effectiveSettings)
     app.mount(rootElement)
 
     window.addEventListener("popstate", event => {
@@ -105,9 +141,11 @@ class MainApp implements Component {
     private hostList: HostList
     private gameList: GameList | null = null
     private settings: StreamSettingsComponent | null = null
+    private languageSaveGeneration = 0
 
-    constructor(api: Api, bootstrapRole: DetailedRole) {
+    constructor(api: Api, user: DetailedUser, bootstrapRole: DetailedRole, effectiveSettings: Settings) {
         this.api = api
+        this.user = user
         this.role = bootstrapRole
 
         // Top Line
@@ -167,7 +205,7 @@ class MainApp implements Component {
         // Settings
         this.settings = new StreamSettingsComponent(
             bootstrapRole.permissions,
-            getLocalStreamSettings(bootstrapRole.default_settings)
+            effectiveSettings,
         )
         this.settings.addChangeListener(this.onSettingsChange.bind(this))
 
@@ -236,22 +274,29 @@ class MainApp implements Component {
         this.setCurrentDisplay("games", { hostId })
     }
 
-    private onSettingsChange() {
+    private async onSettingsChange() {
         if (!this.settings) {
             showNotification(I.index.saveSettingsFailed)
             return
         }
 
-        const previousLanguage = getLocalStreamSettings(globalDefaultSettings()).language
+        const previousLanguage = getCurrentLanguage()
         const newSettings = this.settings.getStreamSettings()
 
-        // store settings in localStorage
-        setLocalStreamSettings(newSettings)
+        // Cache immediately, then serialize/coalesce the account save.
+        const saved = setLocalStreamSettings(newSettings)
         // apply style
         setPageStyle(newSettings.pageStyle)
 
         if (previousLanguage !== newSettings.language) {
-            window.location.reload()
+            // Storage can be denied or full on embedded/private browsers. Do
+            // not destroy an in-memory-only draft by reloading before it is
+            // acknowledged by the server.
+            const generation = ++this.languageSaveGeneration
+            if (await saved && generation === this.languageSaveGeneration) {
+                setCurrentLanguage(newSettings.language)
+                window.location.reload()
+            }
         }
     }
 

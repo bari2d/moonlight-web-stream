@@ -8,6 +8,8 @@ const trueDefaultSettings: Settings =
     // possible values: "left", "right", "up", "down"
     "sidebarEdge": "left",
     "bitrate": 10000,
+    "adaptiveBitrate": true,
+    "minimumBitrate": 2000,
     "fps": 60,
     "videoFrameQueueSize": 3,
     // possible values: "720p", "1080p", "1440p", "4k", "native", "custom"
@@ -24,6 +26,10 @@ const trueDefaultSettings: Settings =
     // Canvas only: when true, draw only on requestAnimationFrame (stable, may add ~0–17 ms). When false, draw on frame submit (low latency).
     "canvasVsync": false,
     "playAudioLocal": false,
+    // Inner Moonlight media encryption between Sunshine/Apollo and the streamer.
+    // WebTransport itself always remains TLS encrypted.
+    "encryptHostVideo": true,
+    "encryptHostAudio": true,
     "audioSampleQueueSize": 20,
     // possible values: "highres", "normal"
     "mouseScrollMode": "highres",

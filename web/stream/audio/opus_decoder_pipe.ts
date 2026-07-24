@@ -47,6 +47,11 @@ export class OpusAudioDecoderPipe implements DataAudioPlayer {
     }
 
     setup(setup: AudioPlayerSetup) {
+        // Setup can be repeated after a controlled Moonlight media reconnect.
+        // Opus prediction state cannot safely span that generation boundary.
+        this.decoder?.destroy()
+        this.decoder = null
+        this.errored = false
         this.setupData = setup
 
         if ("setup" in this.base && typeof this.base.setup == "function") {
