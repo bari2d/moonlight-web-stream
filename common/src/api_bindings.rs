@@ -555,6 +555,8 @@ pub enum StreamServerMessage {
     WebRtc(StreamSignalingMessage),
     WebTransportSetup {
         url: String,
+        #[serde(default)]
+        urls: Vec<String>,
     },
     // Optional Info
     UpdateApp {
@@ -639,6 +641,11 @@ pub enum StreamerStatsUpdate {
     BrowserRtt {
         /// The browser to the streamer
         /// Used with ws protocol to know backlog
+        rtt_ms: f64,
+    },
+    TransportRtt {
+        /// Smoothed round trip time measured by the QUIC stack of the
+        /// WebTransport connection (network only, no browser main thread).
         rtt_ms: f64,
     },
 }

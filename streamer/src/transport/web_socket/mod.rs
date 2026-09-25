@@ -227,6 +227,29 @@ struct VideoRecoveryInner {
     /// Kept separate so an explicit browser request is never swallowed by an
     /// already-outstanding congestion recovery request.
     browser_requested_idr: bool,
+    /// When the last congestion IDR was requested. While the IPC pipe stays
+    /// full (e.g. the browser's network froze), every refused IDR used to
+    /// request another one immediately, producing an IDR storm on recovery.
+    last_congestion_request: Option<std::time::Instant>,
+    /// A refused IDR arrived before the interval elapsed; request again from
+    /// the next frame once it is due.
+    retry_after_refused_idr: bool,
+}
+
+/// Minimum spacing between congestion-driven IDR requests.
+const CONGESTION_IDR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl VideoRecoveryInner {
+    fn congestion_request_due(&self) -> bool {
+        self.last_congestion_request
+            .is_none_or(|at| at.elapsed() >= CONGESTION_IDR_MIN_INTERVAL)
+    }
+
+    fn request_congestion_idr(&mut self) -> DecodeResult {
+        self.recovery_request_outstanding = true;
+        self.last_congestion_request = Some(std::time::Instant::now());
+        DecodeResult::NeedIdr
+    }
 }
 
 impl VideoRecoveryState {
@@ -250,8 +273,11 @@ impl VideoRecoveryState {
             return Some(DecodeResult::NeedIdr);
         }
         if !state.recovery_request_outstanding {
-            state.recovery_request_outstanding = true;
-            return Some(DecodeResult::NeedIdr);
+            return Some(state.request_congestion_idr());
+        }
+        if state.retry_after_refused_idr && state.congestion_request_due() {
+            state.retry_after_refused_idr = false;
+            return Some(state.request_congestion_idr());
         }
         Some(DecodeResult::Ok)
     }
@@ -267,9 +293,15 @@ impl VideoRecoveryState {
         // Receipt of an IDR means the previous request was serviced. If that
         // IDR itself cannot enter IPC, immediately request exactly one new IDR.
         if frame_type == FrameType::Idr {
-            state.recovery_request_outstanding = true;
             state.browser_requested_idr = false;
-            return DecodeResult::NeedIdr;
+            if state.congestion_request_due() {
+                return state.request_congestion_idr();
+            }
+            // Too soon after the last request: retry from the next P-frame
+            // once the interval has passed instead of storming the encoder.
+            state.recovery_request_outstanding = true;
+            state.retry_after_refused_idr = true;
+            return DecodeResult::Ok;
         }
 
         if state.browser_requested_idr {
@@ -278,8 +310,7 @@ impl VideoRecoveryState {
             return DecodeResult::NeedIdr;
         }
         if !state.recovery_request_outstanding {
-            state.recovery_request_outstanding = true;
-            DecodeResult::NeedIdr
+            state.request_congestion_idr()
         } else {
             DecodeResult::Ok
         }
@@ -290,6 +321,7 @@ impl VideoRecoveryState {
         if frame_type == FrameType::Idr {
             state.recovering = false;
             state.recovery_request_outstanding = false;
+            state.retry_after_refused_idr = false;
             // An accepted IDR also satisfies an explicit browser request that
             // raced with, or directly triggered, this frame.
             state.browser_requested_idr = false;
@@ -355,7 +387,10 @@ impl TransportSender for WebSocketTransportSender {
             .try_send_low_priority(StreamerIpcMessage::WebSocketTransport(Bytes::from(framed)))
         {
             Ok(()) => Ok(self.recovery.on_enqueued(frame_type)),
-            Err(TrySendError::Full(_)) => Ok(self.recovery.on_enqueue_failed(frame_type)),
+            Err(TrySendError::Full(_)) => {
+                log::info!("IDRDIAG ipc enqueue full frame_type={}", matches!(frame_type, FrameType::Idr));
+                Ok(self.recovery.on_enqueue_failed(frame_type))
+            }
             Err(TrySendError::Closed(_)) => Err(TransportError::Closed),
         }
     }
@@ -404,6 +439,7 @@ impl TransportSender for WebSocketTransportSender {
                 };
 
                 if let InboundPacket::RequestVideoIdr = packet {
+                    log::info!("IDRDIAG browser requested IDR");
                     self.recovery.request_idr();
                 }
 
@@ -514,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_idr_enqueue_reissues_recovery_once() {
+    fn failed_idr_enqueue_reissues_recovery_after_interval() {
         let state = VideoRecoveryState::default();
 
         assert!(matches!(
@@ -522,9 +558,21 @@ mod tests {
             DecodeResult::NeedIdr
         ));
         assert!(state.before_enqueue(FrameType::Idr).is_none());
+        // Refused again right away: no immediate re-request (no IDR storm).
         assert!(matches!(
             state.on_enqueue_failed(FrameType::Idr),
-            DecodeResult::NeedIdr
+            DecodeResult::Ok
+        ));
+        assert!(matches!(
+            state.before_enqueue(FrameType::PFrame),
+            Some(DecodeResult::Ok)
+        ));
+
+        // Once the interval has passed, the next frame requests exactly one.
+        std::thread::sleep(CONGESTION_IDR_MIN_INTERVAL + std::time::Duration::from_millis(20));
+        assert!(matches!(
+            state.before_enqueue(FrameType::PFrame),
+            Some(DecodeResult::NeedIdr)
         ));
         assert!(matches!(
             state.before_enqueue(FrameType::PFrame),

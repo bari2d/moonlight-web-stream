@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'MoonlightWeb\v2.10.0-low-latency'),
+    [string]$InstallRoot = 'D:\RelocatedFromC\rifat\AppData\Local\MoonlightWeb\v2.10.0-low-latency',
     [string]$RepoRoot,
     [switch]$PreflightOnly
 )

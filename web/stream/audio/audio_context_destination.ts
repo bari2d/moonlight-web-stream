@@ -28,16 +28,22 @@ export class ContextDestinationNodeAudioPlayer extends AudioContextBasePipe impl
 
         this.destination = this.getAudioContext().destination;
 
-        if (this.currentSource) {
+        // A source from a replaced context cannot be connected here; its
+        // owner supplies a new one through setSource right after setup.
+        if (this.currentSource && this.currentSource.context == this.destination.context) {
             this.currentSource.connect(this.destination)
+        } else {
+            this.currentSource = null
         }
 
         return result
     }
 
     setSource(source: AudioNode): void {
-        if (this.currentSource && this.destination) {
-            this.currentSource.disconnect(this.destination)
+        if (this.currentSource && this.destination && this.currentSource.context == this.destination.context) {
+            try {
+                this.currentSource.disconnect(this.destination)
+            } catch (_error) { }
         }
 
         this.currentSource = source

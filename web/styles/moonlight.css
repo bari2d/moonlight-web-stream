@@ -864,9 +864,20 @@ canvas.video-stream {
     pointer-events: none;
 
     color: yellow;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 4px 8px;
+    white-space: pre-wrap;
+    width: max-content;
+    max-width: min(60vw, 42em);
 
-    position: relative;
+    /* Own compositor layer so text updates never repaint the video plane. */
+    position: fixed;
+    top: 8px;
+    left: 8px;
     z-index: 1;
+    contain: content;
+    will-change: transform;
+    transform: translateZ(0);
 }
 
 .local-touch-cursor {

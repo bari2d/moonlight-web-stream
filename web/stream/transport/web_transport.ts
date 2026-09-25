@@ -2,6 +2,7 @@ import { TransportChannelId } from "../../api_bindings.js"
 import { Logger } from "../log.js"
 import { StatValue } from "../stats.js"
 import { allVideoCodecs, VideoCodecSupport } from "../video.js"
+import { redactTransportError } from "./candidates.js"
 import {
     DataTransportChannel,
     Transport,
@@ -26,8 +27,13 @@ const MAX_INCOMING_ALLOCATED_BYTES = 64 * 1024 * 1024
 const MAX_PENDING_VIDEO_FRAMES = 4
 const MAX_PENDING_VIDEO_BYTES = 32 * 1024 * 1024
 const MAX_VIDEO_SEQUENCE_GAP = 32
-const VIDEO_REORDER_DEADLINE_MS = 50
-const VIDEO_REORDER_HARD_DEADLINE_MS = 125
+// A gap in the frame sequence normally closes when QUIC retransmits the lost
+// packets, roughly one round trip after the loss. Requesting an IDR earlier
+// only stacks a key-frame burst on top of the loss, so the soft deadline
+// follows the measured time late frames actually take to arrive.
+const VIDEO_REORDER_MIN_DEADLINE_MS = 50
+const VIDEO_REORDER_MAX_DEADLINE_MS = 150
+const VIDEO_REORDER_HARD_DEADLINE_EXTRA_MS = 100
 const VIDEO_RECOVERY_INITIAL_RETRY_MS = 250
 const VIDEO_RECOVERY_MAX_RETRY_MS = 2000
 const VIDEO_RECOVERY_ENQUEUE_RETRY_MS = 25
@@ -140,6 +146,9 @@ export class WebTransportTransport implements Transport {
     private videoReorderExpectedSequence: number | null = null
     private videoReorderHardTimer: number | null = null
     private videoReorderHardExpectedSequence: number | null = null
+    private videoReorderWaitStartedAtMs: number | null = null
+    private videoLateArrivalMs = 0
+    private videoReorderDeadlineMs = VIDEO_REORDER_MIN_DEADLINE_MS
     private videoRecoveryRetryTimer: number | null = null
 
     // Each key contains only the newest cumulative value or snapshot. No old
@@ -168,6 +177,7 @@ export class WebTransportTransport implements Transport {
     private videoFramesReceived = 0
     private videoFramesDropped = 0
     private videoFramesReordered = 0
+    private videoStreamsSuperseded = 0
     private videoReorderTimeouts = 0
     private videoReorderHardTimeouts = 0
     private videoRecoveryRequests = 0
@@ -224,7 +234,11 @@ export class WebTransportTransport implements Transport {
 
             connectStage = "datagrams"
             try {
-                const datagrams = transport.datagrams
+                // Debug: localStorage "mlw-disable-datagrams"="1" simulates
+                // browsers without datagram support (e.g. iOS Safari).
+                let simulateNoDatagrams = false
+                try { simulateNoDatagrams = localStorage.getItem("mlw-disable-datagrams") == "1" } catch (_error) { }
+                const datagrams = simulateNoDatagrams ? undefined : transport.datagrams
                 if (datagrams?.writable) {
                     // Keep the browser's hidden datagram queue as shallow and
                     // fresh as possible; our pending map already preserves the
@@ -244,7 +258,7 @@ export class WebTransportTransport implements Transport {
                 }
             } catch (error) {
                 this.logger?.debug(
-                    `WebTransport datagrams unavailable; using reliable snapshot fallback: ${error instanceof Error ? error.message : String(error)}`,
+                    `WebTransport datagrams unavailable; using reliable snapshot fallback: ${redactTransportError(error, this.url)}`,
                 )
             }
             if (!this.datagramWriter) {
@@ -473,7 +487,7 @@ export class WebTransportTransport implements Transport {
                 this.pendingDatagrams.clear()
                 this.datagramMode = "reliable-fallback"
                 this.logger?.debug(
-                    `WebTransport datagrams disabled: ${error instanceof Error ? error.message : String(error)}`,
+                    `WebTransport datagrams disabled: ${redactTransportError(error, this.url)}`,
                 )
                 try {
                     writer?.releaseLock()
@@ -825,8 +839,17 @@ export class WebTransportTransport implements Transport {
             }
         } catch (error) {
             const videoPayloadComplete = decoder.lane == LANE_VIDEO_FRAME && decoder.videoPayloadComplete
+            // The server abandons in-flight frames with this code when a newer
+            // IDR is already on its way, so it is not loss and must never ask
+            // for yet another IDR: doing so made every key frame breed the
+            // next one, a burst (and a visible hitch) every few seconds.
+            const supersededVideoReset = isSupersededVideoStreamReset(error) && !decoder.videoFrameComplete
             if (this.lifecycle == "connected") {
-                this.incomingStreamErrors++
+                if (supersededVideoReset) {
+                    this.videoStreamsSuperseded++
+                } else {
+                    this.incomingStreamErrors++
+                }
             }
             decoder.abort()
             const preambleVideoReset = (
@@ -847,7 +870,11 @@ export class WebTransportTransport implements Transport {
                 ) &&
                 !decoder.videoFrameComplete
             )
-            if (recoverableVideoLoss) {
+            if (supersededVideoReset) {
+                // Nothing to do: acceptVideoIdr discards the superseded
+                // sequence range once the replacement IDR lands, and the
+                // reorder deadline still covers an IDR that never arrives.
+            } else if (recoverableVideoLoss) {
                 this.handleVideoStreamFailure(decoder.videoSequence)
             } else if (this.lifecycle == "connected") {
                 if (error instanceof WireProtocolError) {
@@ -1042,6 +1069,15 @@ export class WebTransportTransport implements Transport {
 
         const expected = this.videoExpectedSequence
         if (sequence == expected) {
+            if (isIdr) {
+                // An in-order IDR also answers any outstanding recovery
+                // request; delivering it directly left
+                // videoConsumerRecoveryNeeded set, so the retry timer kept
+                // requesting IDRs every 2 s for the rest of the session.
+                this.acceptVideoIdr(sequence, id, payload)
+                return
+            }
+            this.noteVideoGapClosed()
             this.deliverVideoFrame(sequence, id, payload)
             this.flushPendingVideoFrames()
             return
@@ -1181,6 +1217,23 @@ export class WebTransportTransport implements Transport {
         return this.videoLastDeliveredSequence == null || isNewerU32(sequence, this.videoLastDeliveredSequence)
     }
 
+    /** The frame that later pending frames were waiting for has arrived. */
+    private noteVideoGapClosed(): void {
+        const startedAt = this.videoReorderWaitStartedAtMs
+        if (startedAt == null || this.pendingVideoFrames.size == 0) {
+            return
+        }
+        this.videoReorderWaitStartedAtMs = null
+        const waitedMs = Math.max(0, performance.now() - startedAt)
+        this.videoLateArrivalMs = this.videoLateArrivalMs == 0
+            ? waitedMs
+            : this.videoLateArrivalMs * 0.7 + waitedMs * 0.3
+        this.videoReorderDeadlineMs = Math.min(
+            VIDEO_REORDER_MAX_DEADLINE_MS,
+            Math.max(VIDEO_REORDER_MIN_DEADLINE_MS, Math.round(this.videoLateArrivalMs * 1.5 + 20)),
+        )
+    }
+
     private scheduleVideoReorderDeadline(): void {
         const expected = this.videoExpectedSequence
         if (expected == null || this.pendingVideoFrames.size == 0) {
@@ -1194,6 +1247,7 @@ export class WebTransportTransport implements Transport {
         }
         this.clearVideoReorderTimer()
         this.videoReorderExpectedSequence = expected
+        this.videoReorderWaitStartedAtMs = performance.now()
         this.videoReorderTimer = window.setTimeout(() => {
             this.videoReorderTimer = null
             this.videoReorderExpectedSequence = null
@@ -1208,7 +1262,7 @@ export class WebTransportTransport implements Transport {
                 this.requestVideoRecovery()
                 this.scheduleVideoReorderHardDeadline(expected)
             }
-        }, VIDEO_REORDER_DEADLINE_MS)
+        }, this.videoReorderDeadlineMs)
     }
 
     private scheduleVideoReorderHardDeadline(expected: number): void {
@@ -1230,7 +1284,7 @@ export class WebTransportTransport implements Transport {
                 this.videoReorderHardTimeouts++
                 this.enterVideoRecovery()
             }
-        }, VIDEO_REORDER_HARD_DEADLINE_MS)
+        }, this.videoReorderDeadlineMs + VIDEO_REORDER_HARD_DEADLINE_EXTRA_MS)
     }
 
     private enterVideoRecovery(): void {
@@ -1341,6 +1395,7 @@ export class WebTransportTransport implements Transport {
             this.videoReorderHardTimer = null
         }
         this.videoReorderHardExpectedSequence = null
+        this.videoReorderWaitStartedAtMs = null
     }
 
     private clearVideoRecoveryRetryTimer(): void {
@@ -1398,7 +1453,7 @@ export class WebTransportTransport implements Transport {
             return
         }
         const wasConnected = this.lifecycle == "connected"
-        this.logger?.debug(`WebTransport closed (${info.closeCode}): ${info.reason}`)
+        this.logger?.debug(`WebTransport closed (${info.closeCode}): ${redactTransportError(info.reason, this.url)}`)
         this.lifecycle = "closed"
         this.clearQueues()
         // Intentional local close changes lifecycle to closing before the
@@ -1424,7 +1479,7 @@ export class WebTransportTransport implements Transport {
             return
         }
         this.lifecycle = "failed"
-        this.logger?.debug(`WebTransport failed: ${error instanceof Error ? error.message : String(error)}`)
+        this.logger?.debug(`WebTransport failed: ${redactTransportError(error, this.url)} (datagrams=${this.datagramMode}, reliableQueued=${this.reliableQueuedBytes}B/${this.reliableQueue.length} frames, inFlight=${this.reliableInFlightBytes}B, overflows=${this.reliableQueueOverflows})`, { type: "ifErrorDescription" })
         try {
             this.transport?.close({ closeCode: 1, reason: closeReason })
         } catch (_closeError) { }
@@ -1532,8 +1587,11 @@ export class WebTransportTransport implements Transport {
             webTransportVideoFramesReceived: this.videoFramesReceived,
             webTransportVideoFramesDropped: this.videoFramesDropped,
             webTransportVideoFramesReordered: this.videoFramesReordered,
+            webTransportVideoStreamsSuperseded: this.videoStreamsSuperseded,
             webTransportVideoReorderTimeouts: this.videoReorderTimeouts,
             webTransportVideoReorderHardTimeouts: this.videoReorderHardTimeouts,
+            webTransportVideoReorderDeadlineMs: this.videoReorderDeadlineMs,
+            webTransportVideoLateArrivalMs: Math.round(this.videoLateArrivalMs * 10) / 10,
             webTransportVideoRecoveryRequests: this.videoRecoveryRequests,
             webTransportVideoRecoveryRetryDelayMs: this.videoRecoveryRetryDelayMs,
             webTransportVideoRecoveryQueuedOrInFlight: this.videoRecoveryQueuedOrInFlight ? "true" : "false",
@@ -1583,6 +1641,14 @@ class WebTransportDataTransportChannel implements DataTransportChannel {
 
 class WireProtocolError extends Error { }
 class TruncatedVideoFrameError extends WireProtocolError { }
+
+function isSupersededVideoStreamReset(error: unknown): boolean {
+    if (typeof error != "object" || error == null) {
+        return false
+    }
+    const candidate = error as { source?: unknown, streamErrorCode?: unknown }
+    return candidate.source == "stream" && candidate.streamErrorCode == VIDEO_STREAM_SUPERSEDED_ERROR_CODE
+}
 
 function isServerVideoStreamReset(error: unknown): boolean {
     if (typeof error != "object" || error == null) {

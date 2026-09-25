@@ -25,6 +25,7 @@ export type StreamStatsData = {
     maxStreamerProcessingTimeMs: number | null
     avgStreamerProcessingTimeMs: number | null
     browserRtt: number | null
+    transportRtt: number | null
     transport: Record<string, StatValue>
     video: Record<string, StatValue>
     audio: Record<string, StatValue>
@@ -89,6 +90,9 @@ export function streamStatsToCompactText(statsData: StreamStatsData): string {
     }
     if (statsData.browserRtt != null) {
         lines.push(`Streamer ↔ browser RTT: ${compactNumber(statsData.browserRtt, 1)} ms`)
+    }
+    if (statsData.transportRtt != null) {
+        lines.push(`QUIC path RTT: ${compactNumber(statsData.transportRtt, 1)} ms`)
     }
     if (statsData.avgHostProcessingLatencyMs != null) {
         lines.push(`Average host processing: ${compactNumber(statsData.avgHostProcessingLatencyMs, 1)} ms`)
@@ -167,6 +171,7 @@ streamer round trip time: ${num(statsData.streamerRttMs, "ms")} (variance: ${num
 host processing latency min/max/avg: ${num(statsData.minHostProcessingLatencyMs, "ms")} / ${num(statsData.maxHostProcessingLatencyMs, "ms")} / ${num(statsData.avgHostProcessingLatencyMs, "ms")}
 streamer processing latency min/max/avg: ${num(statsData.minStreamerProcessingTimeMs, "ms")} / ${num(statsData.maxStreamerProcessingTimeMs, "ms")} / ${num(statsData.avgStreamerProcessingTimeMs, "ms")}
 streamer to browser rtt (ws only): ${num(statsData.browserRtt, "ms")}
+quic path rtt (webtransport only): ${num(statsData.transportRtt, "ms")}
 `
     for (const key in statsData.transport) {
         const value = statsData.transport[key]
@@ -243,6 +248,7 @@ export class StreamStats {
         maxStreamerProcessingTimeMs: null,
         avgStreamerProcessingTimeMs: null,
         browserRtt: null,
+        transportRtt: null,
         transport: {},
         video: {},
         audio: {}
@@ -267,12 +273,15 @@ export class StreamStats {
         this.statsData.maxStreamerProcessingTimeMs = null
         this.statsData.avgStreamerProcessingTimeMs = null
         this.statsData.browserRtt = null
+        this.statsData.transportRtt = null
         this.previousWebTransportReceiveSample = null
 
         this.checkEnabled()
     }
     private checkEnabled() {
-        if (this.isEnabled()) {
+        // Collection is always on (one cheap poll per second) so the remote
+        // DIAG log covers normal play too; the mode only gates the overlay.
+        if (this.transport) {
             if (this.statsChannel) {
                 this.statsChannel.removeReceiveListener(this.rawDataListener)
                 this.statsChannel = null
@@ -368,6 +377,8 @@ export class StreamStats {
             this.statsData.avgStreamerProcessingTimeMs = msg.Video.avg_streamer_processing_time_ms
         } else if ("BrowserRtt" in msg) {
             this.statsData.browserRtt = msg.BrowserRtt.rtt_ms
+        } else if ("TransportRtt" in msg) {
+            this.statsData.transportRtt = msg.TransportRtt.rtt_ms
         }
     }
 

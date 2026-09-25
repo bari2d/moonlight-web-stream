@@ -25,6 +25,8 @@ const trueDefaultSettings: Settings =
     "canvasRenderer": false,
     // Canvas only: when true, draw only on requestAnimationFrame (stable, may add ~0–17 ms). When false, draw on frame submit (low latency).
     "canvasVsync": false,
+    // Canvas only. "off": draw as soon as decoded (lowest latency). "balanced": adaptive jitter buffer up to 2 frames. "smooth": up to 4 frames.
+    "videoFramePacing": "balanced",
     "playAudioLocal": false,
     // Inner Moonlight media encryption between Sunshine/Apollo and the streamer.
     // WebTransport itself always remains TLS encrypted.
@@ -46,6 +48,9 @@ const trueDefaultSettings: Settings =
     },
     // possible values: "auto", "webtransport", "webrtc", "websocket"
     "dataTransport": "auto",
+    // WebTransport route filters. "auto" races all server-advertised choices.
+    "webTransportHost": "auto",
+    "webTransportPort": "auto",
     "language": "en",
     "enterFullscreenOnStreamStart": false,
     "toggleFullscreenWithKeybind": false,

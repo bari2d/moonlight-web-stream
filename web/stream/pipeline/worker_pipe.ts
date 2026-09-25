@@ -54,6 +54,7 @@ export class WorkerPipe implements WorkerReceiver {
     private worker: Worker
     private base: WorkerReceiver
     private pipeline: Pipeline
+    private idrRequested = false
 
     constructor(base: WorkerReceiver, pipeline: Pipeline, logger?: Logger, options?: unknown) {
         this.implementationName = `worker_pipe [${pipelineToString(pipeline)}] -> ${base.implementationName}`
@@ -102,10 +103,23 @@ export class WorkerPipe implements WorkerReceiver {
         const data: ToMainMessage = event.data
 
         if ("output" in data) {
+            if ("requestIdr" in data.output) {
+                this.idrRequested = true
+                return
+            }
             this.base.onWorkerMessage(data.output)
         } else if ("log" in data) {
             this.logger?.debug(data.log, data.info)
         }
+    }
+
+    pollRequestIdr(): boolean {
+        const requested = this.idrRequested
+        this.idrRequested = false
+
+        const base = this.base as { pollRequestIdr?: () => boolean }
+        const baseRequested = typeof base.pollRequestIdr == "function" && base.pollRequestIdr() === true
+        return requested || baseRequested
     }
 
     mount() {

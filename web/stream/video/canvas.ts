@@ -3,7 +3,7 @@ import { Logger } from "../log.js"
 import { Pipe, PipeInfo } from "../pipeline/index.js"
 import { addPipePassthrough } from "../pipeline/pipes.js"
 import { allVideoCodecs } from "../video.js"
-import { CanvasRenderer, getStreamRectCorrected, UseCanvasResult, VideoRendererSetup } from "./index.js"
+import { CanvasRenderer, FramePacingMode, getStreamRectCorrected, UseCanvasResult, VideoRendererSetup } from "./index.js"
 
 function getColorSpace(hdrEnabled: boolean): string {
     return hdrEnabled ? "rec2020-pq" : "srgb"
@@ -185,6 +185,10 @@ export type CanvasVideoRendererOptions = {
     /// When false:
     /// - draw only on rAF (VSync-like, may reduce tearing).
     drawOnSubmit?: boolean
+    /// Adaptive jitter buffer for decoded VideoFrames (see FramePacingMode).
+    /// When set to anything but "off" it takes precedence over drawOnSubmit
+    /// for scheduling; the desynchronized context option is kept.
+    framePacing?: FramePacingMode
 }
 
 export class MainCanvasRenderer extends BaseCanvasVideoRenderer {

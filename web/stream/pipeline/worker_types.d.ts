@@ -16,6 +16,8 @@ export type WorkerMessage =
     { track: MediaStreamTrack } |
     { data: ArrayBuffer } |
     { videoData: VideoDecodeUnit } |
+    // A pipe inside the worker needs a key frame (worker -> main only)
+    { requestIdr: true } |
     // Canvas stuff
     { canvas: OffscreenCanvas }
 

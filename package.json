@@ -15,6 +15,7 @@
     }
   },
   "scripts": {
+    "test:transport": "node --test tests/transport-candidates.test.mjs",
     "dev": "npm run generate-bindings && npm-watch build-light",
     "build": "npm run generate-bindings && npm run build-light",
     "build-light": "tsc && npm run copy-static",

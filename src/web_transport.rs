@@ -11,11 +11,16 @@ use std::{
 use actix_http::uri::Authority;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use common::{api_bindings::TransportChannelId, config::WebTransportConfig, ipc::NetworkFeedback};
+use common::{
+    api_bindings::TransportChannelId,
+    config::{QuicCongestionController, WebTransportConfig, WebTransportQuicConfig},
+    ipc::NetworkFeedback,
+};
 use openssl::rand::rand_bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+use wtransport::tls::{rustls, server::build_default_tls_config};
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
 
 const PROTOCOL_VERSION: u8 = 4;
@@ -35,7 +40,15 @@ const DATAGRAM_SNAPSHOT: u8 = 2;
 const OUTBOUND_QUEUE_CAPACITY: usize = 32;
 const INBOUND_QUEUE_CAPACITY: usize = 64;
 const OTHER_QUEUE_CAPACITY: usize = 32;
+const AUDIO_QUEUE_CAPACITY: usize = 8;
 const VIDEO_QUEUE_CAPACITY: usize = 4;
+/// dispatch_outbound relays video, audio and control for the whole session, so
+/// it must never park on one lane. A full audio lane drops the packet (Opus
+/// conceals a single loss); a control lane the browser has stopped reading for
+/// this long ends the session so the client reconnects instead of freezing
+/// with a stuck IPC pipe (which also turned every IDR into an IDR request).
+const AUDIO_SEND_BUDGET: Duration = Duration::from_millis(5);
+const OTHER_SEND_STALL_LIMIT: Duration = Duration::from_secs(2);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RELIABLE_INBOUND_FRAME_BYTES: usize = 128 * 1024;
 // Keep several frame writes live so one flow-controlled stream cannot stall
@@ -87,6 +100,95 @@ const PRIORITY_VIDEO_IDR: i32 = 10;
 const PRIORITY_RELIABLE_OTHER: i32 = 20;
 const PRIORITY_AUDIO: i32 = 30;
 
+/// Newer delta frames get a strictly lower priority than older ones. Quinn
+/// then drains in-flight frame streams in sequence order (retransmissions of
+/// an older frame preempt a newer frame's fresh data) instead of interleaving
+/// them, which made frames complete late and out of order. The sequence is
+/// masked so the value stays below every fixed priority even after wrapping;
+/// the single inversion at the 2^30 wrap only reorders one frame pair.
+/// Set once at startup from `web_transport.quic.ordered_video_priority`.
+static ORDERED_VIDEO_PRIORITY: AtomicBool = AtomicBool::new(false);
+
+fn video_delta_priority(sequence: u32) -> i32 {
+    PRIORITY_VIDEO_DELTA - (sequence & 0x3fff_ffff) as i32
+}
+
+/// Builds the Quinn transport configuration for the browser-facing listener.
+fn build_quic_transport_config(quic: &WebTransportQuicConfig) -> wtransport::quinn::TransportConfig {
+    use wtransport::quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
+    use wtransport::quinn::{AckFrequencyConfig, TransportConfig};
+
+    let mut transport = TransportConfig::default();
+    transport.send_fairness(quic.stream_fairness);
+    if quic.initial_rtt_ms > 0 {
+        transport.initial_rtt(Duration::from_millis(quic.initial_rtt_ms));
+    }
+    if quic.requested_max_ack_delay_ms > 0 {
+        let mut ack_frequency = AckFrequencyConfig::default();
+        ack_frequency.max_ack_delay(Some(Duration::from_millis(quic.requested_max_ack_delay_ms)));
+        transport.ack_frequency_config(Some(ack_frequency));
+    }
+    // `0` keeps each controller's own default initial window.
+    let initial_window = (quic.initial_window_bytes > 0).then(|| quic.initial_window_bytes.max(16 * 1024));
+    match quic.congestion_controller {
+        QuicCongestionController::Cubic => {
+            let mut controller = CubicConfig::default();
+            if let Some(window) = initial_window {
+                controller.initial_window(window);
+            }
+            transport.congestion_controller_factory(Arc::new(controller));
+        }
+        QuicCongestionController::Bbr => {
+            let mut controller = BbrConfig::default();
+            if let Some(window) = initial_window {
+                controller.initial_window(window);
+            }
+            transport.congestion_controller_factory(Arc::new(controller));
+        }
+        QuicCongestionController::NewReno => {
+            let mut controller = NewRenoConfig::default();
+            if let Some(window) = initial_window {
+                controller.initial_window(window);
+            }
+            transport.congestion_controller_factory(Arc::new(controller));
+        }
+        QuicCongestionController::Fixed => {
+            transport.congestion_controller_factory(Arc::new(FixedWindow(
+                initial_window.unwrap_or(1 << 20),
+            )));
+        }
+    }
+    transport
+}
+
+/// Constant congestion window: loss never shrinks it, so frames keep leaving
+/// in one burst. The encoder bitrate is the real rate limit.
+#[derive(Debug, Clone, Copy)]
+struct FixedWindow(u64);
+
+impl wtransport::quinn::congestion::Controller for FixedWindow {
+    fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
+    fn on_mtu_update(&mut self, _: u16) {}
+    fn window(&self) -> u64 {
+        self.0
+    }
+    fn clone_box(&self) -> Box<dyn wtransport::quinn::congestion::Controller> {
+        Box::new(*self)
+    }
+    fn initial_window(&self) -> u64 {
+        self.0
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+impl wtransport::quinn::congestion::ControllerFactory for FixedWindow {
+    fn build(self: Arc<Self>, _: Instant, _: u16) -> Box<dyn wtransport::quinn::congestion::Controller> {
+        Box::new(*self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebTransportConnectionState {
     Waiting,
@@ -101,6 +203,7 @@ pub enum WebTransportConnectionState {
 /// session should be paired with a call to [`Self::shutdown`].
 pub struct WebTransportBridge {
     pub setup_url: String,
+    pub setup_urls: Vec<String>,
     pub outbound: mpsc::Sender<Bytes>,
     pub inbound: mpsc::Receiver<Bytes>,
     pub state: watch::Receiver<WebTransportConnectionState>,
@@ -114,6 +217,7 @@ impl fmt::Debug for WebTransportBridge {
         formatter
             .debug_struct("WebTransportBridge")
             .field("setup_url", &"<redacted>")
+            .field("setup_urls", &"<redacted>")
             .field("state", &*self.state.borrow())
             .field("feedback", &*self.feedback.borrow())
             .finish_non_exhaustive()
@@ -141,14 +245,13 @@ impl fmt::Debug for WebTransportHub {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WebTransportHub")
-            .field("authority", &self.inner.endpoint.authority)
-            .field("path", &self.inner.endpoint.path)
+            .field("endpoints", &self.inner.endpoints)
             .finish_non_exhaustive()
     }
 }
 
 struct HubInner {
-    endpoint: PublicEndpoint,
+    endpoints: Vec<PublicEndpoint>,
     token_ttl: Duration,
     tokens: Mutex<TokenStore>,
     shutdown_tx: watch::Sender<bool>,
@@ -351,7 +454,43 @@ fn canonicalize_https_origin(origin: &str) -> Option<String> {
     })
 }
 
-/// Starts the process-wide UDP/HTTP3 endpoint. Disabled configuration is a
+#[derive(Debug)]
+struct HostCertificateResolver {
+    hosts: HashMap<String, Arc<dyn rustls::server::ResolvesServerCert>>,
+    default: Arc<dyn rustls::server::ResolvesServerCert>,
+}
+
+impl rustls::server::ResolvesServerCert for HostCertificateResolver {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        match hello.server_name() {
+            Some(host) => self.hosts.get(&host.to_ascii_lowercase())?.resolve(hello),
+            // IP-literal clients do not send SNI. Preserve the legacy primary
+            // identity for them; authority/token validation still applies.
+            None => self.default.resolve(hello),
+        }
+    }
+}
+
+fn public_endpoints(config: &WebTransportConfig) -> Result<Vec<PublicEndpoint>> {
+    let mut endpoints: Vec<PublicEndpoint> = Vec::new();
+    for url in std::iter::once(&config.public_url).chain(&config.alternate_public_urls) {
+        let endpoint = PublicEndpoint::parse(url)?;
+        if !endpoints.iter().any(|existing| {
+            existing.matches_authority(&endpoint.authority) && existing.path == endpoint.path
+        }) {
+            endpoints.push(endpoint);
+        }
+    }
+    if endpoints.len() > 6 {
+        bail!("WebTransport supports at most six distinct public URLs");
+    }
+    Ok(endpoints)
+}
+
+/// Starts the process-wide UDP/HTTP3 endpoints. Disabled configuration is a
 /// successful no-op, making integration into the existing server startup easy.
 pub async fn start(config: WebTransportConfig) -> Result<Option<WebTransportHub>> {
     if !config.enabled {
@@ -361,31 +500,74 @@ pub async fn start(config: WebTransportConfig) -> Result<Option<WebTransportHub>
         bail!("WebTransport token_ttl must be greater than zero");
     }
 
-    let public_endpoint = PublicEndpoint::parse(&config.public_url)?;
+    let public_endpoints = public_endpoints(&config)?;
     let identity = Identity::load_pemfiles(&config.certificate_pem, &config.private_key_pem)
         .await
         .context("failed to load WebTransport TLS identity")?;
-    let server_config = ServerConfig::builder()
-        .with_bind_address(config.bind_address)
-        .with_identity(identity)
-        .max_idle_timeout(Some(Duration::from_secs(20)))
-        .context("invalid WebTransport idle timeout")?
-        .keep_alive_interval(Some(Duration::from_secs(3)))
-        .allow_migration(true)
-        .build();
-    let endpoint =
-        Endpoint::server(server_config).context("failed to bind WebTransport endpoint")?;
-    let local_address = endpoint.local_addr()?;
+    let mut tls = build_default_tls_config(identity);
+    let mut hosts = HashMap::new();
+    for endpoint in &public_endpoints {
+        hosts.insert(
+            endpoint.host.to_ascii_lowercase(),
+            tls.cert_resolver.clone(),
+        );
+    }
+    for extra in &config.additional_tls_identities {
+        if extra.hostnames.is_empty() {
+            bail!("WebTransport TLS identity must specify at least one hostname");
+        }
+        let identity = Identity::load_pemfiles(&extra.certificate_pem, &extra.private_key_pem)
+            .await
+            .context("failed to load additional WebTransport TLS identity")?;
+        let extra_tls = build_default_tls_config(identity);
+        for hostname in &extra.hostnames {
+            let Some(resolver) = hosts.get_mut(&hostname.to_ascii_lowercase()) else {
+                bail!("WebTransport TLS hostname is not in the configured public URLs: {hostname}");
+            };
+            *resolver = extra_tls.cert_resolver.clone();
+        }
+    }
+    tls.cert_resolver = Arc::new(HostCertificateResolver {
+        hosts,
+        default: tls.cert_resolver.clone(),
+    });
+
+    // Bind every socket before spawning any tasks: a bad extra port must not
+    // leave an orphaned partial deployment behind when startup returns an error.
+    let mut listeners = Vec::new();
+    let mut addresses = vec![config.bind_address];
+    for address in &config.additional_bind_addresses {
+        if !addresses.contains(address) {
+            addresses.push(*address);
+        }
+    }
+    ORDERED_VIDEO_PRIORITY.store(config.quic.ordered_video_priority, Ordering::Relaxed);
+    for address in addresses {
+        let server_config = ServerConfig::builder()
+            .with_bind_address(address)
+            .with_custom_tls_and_transport(tls.clone(), build_quic_transport_config(&config.quic))
+            .max_idle_timeout(Some(Duration::from_secs(20)))
+            .context("invalid WebTransport idle timeout")?
+            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .allow_migration(true)
+            .build();
+        let endpoint = Endpoint::server(server_config)
+            .with_context(|| format!("failed to bind WebTransport endpoint {address}"))?;
+        listeners.push(endpoint);
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let inner = Arc::new(HubInner {
-        endpoint: public_endpoint,
+        endpoints: public_endpoints,
         token_ttl: config.token_ttl,
         tokens: Mutex::new(TokenStore::default()),
         shutdown_tx,
     });
-    tokio::spawn(run_listener(endpoint, inner.clone(), shutdown_rx));
-    info!(address = %local_address, "WebTransport endpoint listening");
+    for endpoint in listeners {
+        let local_address = endpoint.local_addr()?;
+        tokio::spawn(run_listener(endpoint, inner.clone(), shutdown_rx.clone()));
+        info!(address = %local_address, "WebTransport endpoint listening");
+    }
 
     Ok(Some(WebTransportHub { inner }))
 }
@@ -426,7 +608,16 @@ impl WebTransportHub {
         info!("WebTransport one-use bridge registered");
 
         Ok(WebTransportBridge {
-            setup_url: self.inner.endpoint.setup_url(&token_text),
+            setup_url: self.inner.endpoints[0].setup_url(&token_text),
+            // Every candidate carries the same one-use credential. The first
+            // valid CONNECT atomically claims the bridge; racers cannot create
+            // duplicate media sessions or replay it on another listener.
+            setup_urls: self
+                .inner
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.setup_url(&token_text))
+                .collect(),
             outbound: outbound_tx,
             inbound: inbound_rx,
             state: state_rx,
@@ -470,12 +661,13 @@ async fn handle_incoming(incoming: IncomingSession, inner: Arc<HubInner>) {
     let remote = request.remote_address();
     info!(remote = %remote, "WebTransport HTTP/3 request received");
     let Some(token_hash) = inner
-        .endpoint
-        .validate_request(request.authority(), request.path())
+        .endpoints
+        .iter()
+        .find_map(|endpoint| endpoint.validate_request(request.authority(), request.path()))
     else {
         warn!(
             remote = %remote,
-            authority_matches = inner.endpoint.matches_authority(request.authority()),
+            authority_matches = inner.endpoints.iter().any(|endpoint| endpoint.matches_authority(request.authority())),
             "WebTransport request rejected before token lookup"
         );
         request.forbidden().await;
@@ -524,6 +716,7 @@ async fn handle_incoming(incoming: IncomingSession, inner: Arc<HubInner>) {
     // exposing `transport.ready`. The patched protocol dependency guarantees
     // `:status` is encoded ahead of this regular header.
     let draft02_requested = requests_draft02_response(request.headers());
+    let authority = request.authority().to_owned();
     let accepted = if draft02_requested {
         request
             .accept_with_headers([(DRAFT02_RESPONSE_HEADER, DRAFT02_RESPONSE_VALUE)])
@@ -542,7 +735,7 @@ async fn handle_incoming(incoming: IncomingSession, inner: Arc<HubInner>) {
             return;
         }
     };
-    info!(remote = %remote, "WebTransport session accepted");
+    info!(remote = %remote, authority = %authority, "WebTransport session accepted");
 
     if let Err(failure) = run_connection(connection, pending).await {
         // Transport/stream errors do not contain the CONNECT request path, so
@@ -690,6 +883,7 @@ enum ReliableReplacementKey {
     StatsVideo,
     StatsRtt,
     StatsBrowserRtt,
+    StatsTransportRtt,
     Rtt,
 }
 
@@ -710,6 +904,8 @@ fn reliable_replacement_key(frame: &[u8]) -> Option<ReliableReplacementKey> {
                 Some(ReliableReplacementKey::StatsRtt)
             } else if json.starts_with(br#"{"BrowserRtt":"#) {
                 Some(ReliableReplacementKey::StatsBrowserRtt)
+            } else if json.starts_with(br#"{"TransportRtt":"#) {
+                Some(ReliableReplacementKey::StatsTransportRtt)
             } else {
                 None
             }
@@ -1050,7 +1246,7 @@ async fn run_connection_inner(
         .await
         .map_err(|error| ConnectionFailure::new(ConnectionStage::OpenReliableServerLane, error))?;
     let (video_tx, video_rx) = video_admission_channel();
-    let (audio_tx, audio_rx) = watch::channel(None::<Bytes>);
+    let (audio_tx, audio_rx) = reliable_outbound_channel(AUDIO_QUEUE_CAPACITY);
     let (other_tx, other_rx) = reliable_outbound_channel(OTHER_QUEUE_CAPACITY);
     let datagram_state = Arc::new(Mutex::new(DatagramState::default()));
     let congestion_counters = Arc::new(CongestionCounters::default());
@@ -1064,7 +1260,7 @@ async fn run_connection_inner(
         result = dispatch_outbound(
             &mut bridge.outbound_rx,
             video_tx,
-            audio_tx.clone(),
+            audio_tx,
             other_tx,
             bridge.inbound_tx.clone(),
             congestion_counters.clone(),
@@ -1077,7 +1273,7 @@ async fn run_connection_inner(
             congestion_counters.clone(),
             recovery_request,
         ) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteVideo, error)),
-        result = write_latest_lane(&mut audio_stream, audio_rx) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteAudio, error)),
+        result = write_queue_lane(&mut audio_stream, audio_rx) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteAudio, error)),
         result = write_queue_lane(&mut other_stream, other_rx) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::WriteReliableServer, error)),
         result = read_reliable_inbound(&mut reliable_client_stream, bridge.inbound_tx.clone(), bridge.shutdown_rx.clone(), datagram_state.clone()) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::ReadReliableClient, error)),
         result = read_datagrams(connection.clone(), bridge.inbound_tx.clone(), bridge.shutdown_rx.clone(), datagram_state) => result.map_err(|error| ConnectionFailure::new(ConnectionStage::ReadDatagrams, error)),
@@ -1135,7 +1331,7 @@ async fn accept_reliable_inbound(
 async fn dispatch_outbound(
     outbound_rx: &mut mpsc::Receiver<Bytes>,
     video_tx: VideoAdmissionSender,
-    audio_tx: watch::Sender<Option<Bytes>>,
+    audio_tx: ReliableOutboundSender,
     other_tx: ReliableOutboundSender,
     inbound_tx: mpsc::Sender<Bytes>,
     congestion_counters: Arc<CongestionCounters>,
@@ -1209,18 +1405,32 @@ async fn dispatch_outbound(
                 }
             }
             TransportChannelId::HOST_AUDIO => {
-                // Audio must never wait behind video. If the browser stops
-                // consuming, recent audio is more useful than delayed audio.
-                audio_tx.send_replace(Some(frame));
+                // Opus prediction state spans packets. Preserve its strict
+                // order instead of replacing an unsent packet with the latest
+                // one, which produces audible cuts and garbling downstream.
+                match tokio::time::timeout(AUDIO_SEND_BUDGET, audio_tx.send(frame)).await {
+                    Ok(result) => {
+                        result.map_err(|_| anyhow!("WebTransport audio queue is closed"))?
+                    }
+                    Err(_) => {
+                        congestion_counters
+                            .admission_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!("WebTransport audio lane full; dropped one audio packet");
+                    }
+                }
             }
             _ => {
                 // Lane 3 is reliable and ordered. Replace stale snapshots when
                 // possible; otherwise wait for bounded capacity so a short
                 // client stall cannot kill the transport or lose a transition.
-                other_tx
-                    .send(frame)
-                    .await
-                    .map_err(|_| anyhow!("WebTransport reliable outbound queue is closed"))?;
+                match tokio::time::timeout(OTHER_SEND_STALL_LIMIT, other_tx.send(frame)).await {
+                    Ok(result) => result
+                        .map_err(|_| anyhow!("WebTransport reliable outbound queue is closed"))?,
+                    Err(_) => bail!(
+                        "WebTransport control lane stalled for {OTHER_SEND_STALL_LIMIT:?}; closing the session"
+                    ),
+                }
             }
         }
     }
@@ -1276,24 +1486,6 @@ async fn publish_network_feedback(
             _ = shutdown_rx.changed() => return,
             _ = connection.closed() => return,
         }
-    }
-}
-
-async fn write_latest_lane(
-    stream: &mut wtransport::SendStream,
-    mut changed: watch::Receiver<Option<Bytes>>,
-) -> Result<()> {
-    loop {
-        changed.changed().await?;
-        // `send_replace(None)` from this consumer used to increment the same
-        // watch version it was waiting on. Once audio started, None -> None
-        // therefore woke the task forever and hot-looped a Tokio worker. A
-        // receiver-local version cursor coalesces producer updates without
-        // publishing anything back into the channel.
-        let Some(frame) = changed.borrow_and_update().clone() else {
-            continue;
-        };
-        write_frame(stream, &frame).await?;
     }
 }
 
@@ -1533,6 +1725,7 @@ async fn write_video_stream(
     guard_stopped_tx: mpsc::UnboundedSender<u64>,
 ) -> Result<VideoStreamWriteOutcome> {
     let is_idr = frame.get(1) == Some(&1);
+    let ordered_priority = ORDERED_VIDEO_PRIORITY.load(Ordering::Relaxed);
     // Delta frames always use the fixed latency budget. Avoid taking Quinn's
     // connection-state lock at frame rate just to compute that constant; only
     // the less frequent IDR path needs the live RTT-scaled allowance.
@@ -1556,6 +1749,8 @@ async fn write_video_stream(
     };
     stream.set_priority(if is_idr {
         PRIORITY_VIDEO_IDR
+    } else if ordered_priority {
+        video_delta_priority(sequence)
     } else {
         PRIORITY_VIDEO_DELTA
     });
@@ -2141,6 +2336,59 @@ mod tests {
     }
 
     #[test]
+    fn alternative_urls_share_a_single_origin_bound_bridge() {
+        let config = WebTransportConfig {
+            public_url: "https://first.test:443/transport".into(),
+            alternate_public_urls: vec!["https://second.test:8443/transport".into()],
+            ..Default::default()
+        };
+        let (shutdown_tx, _) = watch::channel(false);
+        let hub = WebTransportHub {
+            inner: Arc::new(HubInner {
+                endpoints: public_endpoints(&config).unwrap(),
+                token_ttl: Duration::from_secs(60),
+                tokens: Mutex::new(TokenStore::default()),
+                shutdown_tx,
+            }),
+        };
+        let bridge = hub.register_for_origin("https://page.test").unwrap();
+        assert_eq!(bridge.setup_url, bridge.setup_urls[0]);
+        assert_eq!(bridge.setup_urls.len(), 2);
+        let paths: Vec<_> = bridge
+            .setup_urls
+            .iter()
+            .map(|url| {
+                let authority_start = "https://".len();
+                &url[url[authority_start..].find('/').unwrap() + authority_start..]
+            })
+            .collect();
+        let hash = hub.inner.endpoints[0]
+            .validate_request("first.test", paths[0])
+            .unwrap();
+        assert_eq!(
+            Some(hash),
+            hub.inner.endpoints[1].validate_request("second.test:8443", paths[1])
+        );
+        let mut tokens = hub.inner.tokens.lock().unwrap();
+        assert!(matches!(
+            tokens.consume(&hash, "https://wrong.test", Instant::now()),
+            Err(TokenConsumeRejection::OriginMismatch)
+        ));
+        assert!(
+            tokens
+                .consume(&hash, "https://page.test", Instant::now())
+                .is_ok()
+        );
+        assert!(matches!(
+            tokens.consume(&hash, "https://page.test", Instant::now()),
+            Err(TokenConsumeRejection::Unknown)
+        ));
+        let debug = format!("{bridge:?}");
+        assert!(!debug.contains("token="));
+        assert!(!debug.contains("first.test"));
+    }
+
+    #[test]
     fn frame_length_codec_is_big_endian_and_bounded() {
         assert_eq!(encode_frame_length(0x01_02_03).unwrap(), [0, 1, 2, 3]);
         assert_eq!(decode_frame_length([0, 1, 2, 3]).unwrap(), 0x01_02_03);
@@ -2161,6 +2409,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn video_delta_priority_stays_below_fixed_priorities_and_orders_by_sequence() {
+        assert_eq!(video_delta_priority(0), PRIORITY_VIDEO_DELTA);
+        assert!(video_delta_priority(1) < video_delta_priority(0));
+        assert!(video_delta_priority(u32::MAX) < PRIORITY_VIDEO_IDR);
+        assert!(video_delta_priority(0x3fff_ffff) < PRIORITY_VIDEO_IDR);
+        assert!(video_delta_priority(0x4000_0000) <= PRIORITY_VIDEO_DELTA);
+    }
+
+    #[test]
+    fn quic_transport_config_builds_for_every_controller() {
+        for controller in [
+            QuicCongestionController::Cubic,
+            QuicCongestionController::Bbr,
+            QuicCongestionController::NewReno,
+            QuicCongestionController::Fixed,
+        ] {
+            let quic = WebTransportQuicConfig {
+                congestion_controller: controller,
+                ..WebTransportQuicConfig::default()
+            };
+            let _ = build_quic_transport_config(&quic);
+        }
     }
 
     #[test]
@@ -2347,6 +2620,54 @@ mod tests {
     }
 
     #[test]
+    fn multiple_public_endpoints_preserve_order_dedupe_and_reject_unlisted_ports() {
+        let config = WebTransportConfig {
+            public_url: "https://first.test:443/transport".into(),
+            alternate_public_urls: vec![
+                "https://FIRST.test:443/transport".into(),
+                "https://second.test:443/transport".into(),
+                "https://first.test:8443/transport".into(),
+            ],
+            ..Default::default()
+        };
+        let endpoints = public_endpoints(&config).unwrap();
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[1].host, "second.test");
+        assert_eq!(endpoints[2].port, 8443);
+        let path = format!("/transport?v=4&token={}", encode_token(&[7; 32]));
+        for authority in ["first.test", "second.test", "first.test:8443"] {
+            assert!(
+                endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.validate_request(authority, &path).is_some())
+            );
+        }
+        for authority in ["unlisted.test", "second.test:8443", "first.test:4443"] {
+            assert!(
+                !endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.validate_request(authority, &path).is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn public_endpoint_list_is_bounded_and_all_entries_are_validated() {
+        let mut config = WebTransportConfig {
+            public_url: "https://first.test:443/transport".into(),
+            ..Default::default()
+        };
+        config
+            .alternate_public_urls
+            .push("http://invalid.test:443/transport".into());
+        assert!(public_endpoints(&config).is_err());
+        config.alternate_public_urls = (1..7)
+            .map(|i| format!("https://h{i}.test:443/transport"))
+            .collect();
+        assert!(public_endpoints(&config).is_err());
+    }
+
+    #[test]
     fn https_origins_are_strictly_canonicalized() {
         assert_eq!(
             canonicalize_https_origin("HTTPS://Example.TEST:443"),
@@ -2377,7 +2698,7 @@ mod tests {
     async fn reliable_outbound_congestion_applies_backpressure_without_dropping() {
         let (outbound_tx, mut outbound_rx) = mpsc::channel(2);
         let (video_tx, _video_rx) = video_admission_channel();
-        let (audio_tx, _audio_rx) = watch::channel(None);
+        let (audio_tx, _audio_rx) = reliable_outbound_channel(AUDIO_QUEUE_CAPACITY);
         let (other_tx, mut other_rx) = reliable_outbound_channel(1);
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
 
@@ -2408,6 +2729,41 @@ mod tests {
         assert!(dispatch.await.is_ok());
         assert_eq!(other_rx.recv().await, Some(second));
         assert_eq!(other_rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn audio_dispatch_preserves_every_packet_in_order() {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+        let (video_tx, _video_rx) = video_admission_channel();
+        let (audio_tx, mut audio_rx) = reliable_outbound_channel(4);
+        let (other_tx, _other_rx) = reliable_outbound_channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let frames = [
+            Bytes::from_static(&[TransportChannelId::HOST_AUDIO, 1]),
+            Bytes::from_static(&[TransportChannelId::HOST_AUDIO, 2]),
+            Bytes::from_static(&[TransportChannelId::HOST_AUDIO, 3]),
+        ];
+        for frame in &frames {
+            outbound_tx.send(frame.clone()).await.unwrap();
+        }
+        drop(outbound_tx);
+
+        dispatch_outbound(
+            &mut outbound_rx,
+            video_tx,
+            audio_tx,
+            other_tx,
+            inbound_tx,
+            Arc::new(CongestionCounters::default()),
+            Arc::new(RecoveryRequestState::default()),
+        )
+        .await
+        .unwrap();
+
+        for frame in frames {
+            assert_eq!(audio_rx.recv().await, Some(frame));
+        }
+        assert_eq!(audio_rx.recv().await, None);
     }
 
     fn stats_frame(kind: &str, marker: u8) -> Bytes {
@@ -2565,7 +2921,7 @@ mod tests {
     async fn dropping_a_delta_after_a_queued_idr_requests_a_fresh_idr() {
         let (outbound_tx, mut outbound_rx) = mpsc::channel(VIDEO_QUEUE_CAPACITY + 1);
         let (video_tx, mut video_rx) = video_admission_channel();
-        let (audio_tx, _audio_rx) = watch::channel(None);
+        let (audio_tx, _audio_rx) = reliable_outbound_channel(AUDIO_QUEUE_CAPACITY);
         let (other_tx, _other_rx) = reliable_outbound_channel(1);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
 
@@ -2606,7 +2962,7 @@ mod tests {
     async fn idr_supersedes_a_full_stale_delta_queue() {
         let (outbound_tx, mut outbound_rx) = mpsc::channel(VIDEO_QUEUE_CAPACITY + 1);
         let (video_tx, mut video_rx) = video_admission_channel();
-        let (audio_tx, _audio_rx) = watch::channel(None);
+        let (audio_tx, _audio_rx) = reliable_outbound_channel(AUDIO_QUEUE_CAPACITY);
         let (other_tx, _other_rx) = reliable_outbound_channel(1);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
 
@@ -2678,7 +3034,7 @@ mod tests {
     async fn short_video_burst_does_not_trigger_false_congestion_recovery() {
         let (outbound_tx, mut outbound_rx) = mpsc::channel(VIDEO_QUEUE_CAPACITY);
         let (video_tx, mut video_rx) = video_admission_channel();
-        let (audio_tx, _audio_rx) = watch::channel(None);
+        let (audio_tx, _audio_rx) = reliable_outbound_channel(AUDIO_QUEUE_CAPACITY);
         let (other_tx, _other_rx) = reliable_outbound_channel(1);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
 

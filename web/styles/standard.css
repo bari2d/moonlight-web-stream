@@ -1258,10 +1258,28 @@ canvas.video-stream {
     pointer-events: none;
 
     color: #00f7ff;
-    text-shadow: 0 0 4px black, 2px 2px 4px black, -2px -2px 4px black, 2px -2px 4px black, -2px 2px 4px black;
+    /* A flat backdrop rasterises in one pass; the five blurred text-shadows
+       this used to have were re-rendered on every update, on top of the
+       video, and made the stream stutter on low-end GPUs. */
+    background: rgba(0, 0, 0, 0.55);
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-family: ui-monospace, monospace;
+    font-size: 0.85em;
+    line-height: 1.25;
+    white-space: pre-wrap;
+    width: max-content;
+    max-width: min(60vw, 42em);
 
-    position: relative;
+    /* Own compositor layer: text updates must not invalidate the video
+       plane underneath. */
+    position: fixed;
+    top: 8px;
+    left: 8px;
     z-index: 1;
+    contain: content;
+    will-change: transform;
+    transform: translateZ(0);
 }
 
 .local-touch-cursor {

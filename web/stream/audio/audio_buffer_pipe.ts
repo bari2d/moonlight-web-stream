@@ -34,6 +34,7 @@ export class AudioBufferPipe implements PcmAudioPlayer {
     setup(setup: AudioPlayerSetup) {
         this.channels = setup.channels
         this.sampleRate = setup.sampleRate
+        this.nextAudioPlayTime = null
 
         let result
         if ("setup" in this.base && typeof this.base.setup == "function") {
@@ -67,8 +68,11 @@ export class AudioBufferPipe implements PcmAudioPlayer {
             return
         }
 
-        const TARGET_LATENCY_SECS = 0.12
-        const MAX_LATENCY_SECS = 0.25
+        // The transport already preserves a short ordered packet window. Keep
+        // only enough browser-side audio to absorb ordinary scheduling jitter;
+        // larger values make sound noticeably trail the live video and input.
+        const TARGET_LATENCY_SECS = 0.04
+        const MAX_LATENCY_SECS = 0.08
 
         const now = this.base.getAudioContext().currentTime
 
@@ -78,11 +82,13 @@ export class AudioBufferPipe implements PcmAudioPlayer {
 
         let ahead = this.nextAudioPlayTime - this.base.getAudioContext().currentTime
 
-        // Too far ahead -> gently pull back audio
+        // If a transport backlog arrives in a burst, continue decoding Opus so
+        // its prediction state remains valid, but discard this decoded PCM.
+        // Already-scheduled audio then catches up naturally without overlapping
+        // sources or preserving hundreds of milliseconds of stale sound.
         if (ahead > MAX_LATENCY_SECS) {
-            console.debug("Audio too far ahead, trimming latency");
-            this.nextAudioPlayTime = now + TARGET_LATENCY_SECS;
-            ahead = TARGET_LATENCY_SECS;
+            console.debug("Audio backlog trimmed")
+            return
         }
 
         // Underrun -> jump forward
@@ -115,5 +121,15 @@ export class AudioBufferPipe implements PcmAudioPlayer {
 
     getBase(): Pipe | null {
         return this.base
+    }
+
+    cleanup(): void {
+        this.nextAudioPlayTime = null
+        this.node?.disconnect()
+        this.node = null
+
+        if ("cleanup" in this.base && typeof this.base.cleanup == "function") {
+            this.base.cleanup()
+        }
     }
 }

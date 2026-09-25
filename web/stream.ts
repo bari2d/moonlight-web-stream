@@ -1,5 +1,5 @@
 import "./polyfill/index.js"
-import { Api, apiGetRole, apiGetUser, apiGetUserSettings, apiPatchUserSettings, getApi, isRetryableApiError } from "./api.js";
+import { Api, fetchApi, apiGetRole, apiGetUser, apiGetUserSettings, apiPatchUserSettings, getApi, isRetryableApiError } from "./api.js";
 import { Component } from "./component/index.js";
 import { showNotification } from "./component/notification.js";
 import { InfoEvent, Stream } from "./stream/index.js"
@@ -11,15 +11,60 @@ import { SelectComponent } from "./component/input.js";
 import { LogMessageType, StreamCapabilities, StreamKeys, StreamPermissions } from "./api_bindings.js";
 import { KeyboardModeEvent, KeyboardModeWillChangeEvent, ScreenKeyboard, TextEvent } from "./screen_keyboard.js";
 import { FormModal } from "./component/modal/form.js";
-import { streamStatsToText } from "./stream/stats.js";
+import { StreamStats, streamStatsToText } from "./stream/stats.js";
 import { getCurrentLanguage, getTranslations, setCurrentLanguage } from "./i18n.js";
 import { requestKeyboardLock } from "./iframe.js";
 import { setStyle as setPageStyle } from "./styles/index.js";
 
 let I = getTranslations(getCurrentLanguage())
 
+// Mirror the stream debug log to the server (POST /api/client-log) so browsers
+// without reachable devtools, like iOS Safari, can still be diagnosed.
+let remoteLogApi: Api | null = null
+const remoteLogSession = Math.random().toString(36).slice(2, 10)
+const remoteLogQueue: string[] = []
+let remoteLogTimer: number | null = null
+function queueRemoteLog(line: string) {
+    remoteLogQueue.push(`${(performance.now() / 1000).toFixed(3)}s ${line}`)
+    if (remoteLogQueue.length > 500) {
+        remoteLogQueue.splice(0, remoteLogQueue.length - 500)
+    }
+    if (remoteLogTimer == null) {
+        remoteLogTimer = window.setTimeout(flushRemoteLog, 1000)
+    }
+}
+function flushRemoteLog() {
+    remoteLogTimer = null
+    if (!remoteLogApi) {
+        remoteLogTimer = window.setTimeout(flushRemoteLog, 1000)
+        return
+    }
+    const lines = remoteLogQueue.splice(0, 200)
+    if (lines.length == 0) {
+        return
+    }
+    // One request in flight at a time; on failure (e.g. a congested uplink
+    // timing the POST out) put the lines back so nothing is silently lost.
+    remoteLogTimer = -1
+    fetchApi(remoteLogApi, "/client-log", "POST", {
+        json: { session: remoteLogSession, user_agent: navigator.userAgent, lines },
+        response: "ignore",
+    }, 15000).catch(() => {
+        remoteLogQueue.unshift(...lines)
+        if (remoteLogQueue.length > 1000) {
+            remoteLogQueue.splice(0, remoteLogQueue.length - 1000)
+        }
+    }).then(() => {
+        remoteLogTimer = null
+        if (remoteLogQueue.length > 0) {
+            remoteLogTimer = window.setTimeout(flushRemoteLog, 1000)
+        }
+    })
+}
+
 async function startApp() {
     const api = await getApi()
+    remoteLogApi = api
 
     const userSettingsRequest = apiGetUserSettings(api).then(
         snapshot => ({ snapshot, error: undefined }),
@@ -143,6 +188,33 @@ class ViewerApp implements Component {
     private streamMutationObserver: MutationObserver | null = null
     private readonly eventListenerAbort = new AbortController()
     private statsUpdateInterval: number | null = null
+    // TEMP latency diagnostics: summarize browser RTT and transport/video
+    // counters every 2 s into the remote client log.
+    private diagRtts: number[] = []
+    private diagLastFlush = 0
+    private recordStatsDiagnostics(current: ReturnType<StreamStats["getCurrentStats"]>) {
+        if (current.browserRtt != null) {
+            this.diagRtts.push(current.browserRtt)
+        }
+        const now = performance.now()
+        if (now - this.diagLastFlush < 2000) {
+            return
+        }
+        this.diagLastFlush = now
+        const rtts = this.diagRtts.splice(0)
+        const round = (value: unknown) => typeof value == "number" ? Math.round(value * 10) / 10 : value
+        const pick = (record: Record<string, unknown>) => {
+            const out: Record<string, unknown> = {}
+            for (const key in record) {
+                const value = record[key]
+                if (value != null && value !== "null") {
+                    out[key] = round(value)
+                }
+            }
+            return out
+        }
+        queueRemoteLog(`DIAG rtt[min=${round(Math.min(...rtts))} max=${round(Math.max(...rtts))} n=${rtts.length}] quic=${round(current.transportRtt)} host=${round(current.streamerRttMs)} hostLat=${round(current.avgHostProcessingLatencyMs)}/${round(current.maxHostProcessingLatencyMs)} strLat=${round(current.avgStreamerProcessingTimeMs)}/${round(current.maxStreamerProcessingTimeMs)} transport=${JSON.stringify(pick(current.transport))} video=${JSON.stringify(pick(current.video))}`)
+    }
     private lastStatsText = ""
     private touchUpdateFrame: number | null = null
     private gamepadUpdateFrame: number | null = null
@@ -165,6 +237,17 @@ class ViewerApp implements Component {
 
     constructor(api: Api, hostId: number, appId: number, permissions: StreamPermissions, settings: Settings) {
         this.api = api
+
+        window.addEventListener("error", event => {
+            queueRemoteLog(`window error: ${event.message} at ${event.filename}:${event.lineno}:${event.colno}`)
+        })
+        window.addEventListener("unhandledrejection", event => {
+            const reason = event.reason
+            queueRemoteLog(`unhandled rejection: ${reason?.stack ?? reason?.message ?? String(reason)}`)
+        })
+        document.addEventListener("visibilitychange", () => {
+            queueRemoteLog(`visibility: ${document.visibilityState}`)
+        })
 
         const inputElement = document.getElementById("input")
         if (!(inputElement instanceof HTMLDivElement)) {
@@ -192,19 +275,23 @@ class ViewerApp implements Component {
 
         this.statsUpdateInterval = window.setInterval(() => {
             const stats = this.getStream()?.getStats()
+            if (stats) {
+                this.recordStatsDiagnostics(stats.getCurrentStats())
+            }
             if (stats && stats.isEnabled()) {
                 this.statsDiv.hidden = false
 
-                const text = streamStatsToText(stats.getCurrentStats(), stats.getMode())
+                const current = stats.getCurrentStats()
+                const text = streamStatsToText(current, stats.getMode())
                 if (text != this.lastStatsText) {
-                    this.statsDiv.innerText = text
+                    this.statsDiv.textContent = text
                     this.lastStatsText = text
                 }
             } else {
                 this.statsDiv.hidden = true
                 this.lastStatsText = ""
             }
-        }, 250)
+        }, 500)
         this.div.appendChild(this.statsDiv)
         this.div.appendChild(this.localTouchCursorDiv)
 
@@ -321,6 +408,12 @@ class ViewerApp implements Component {
 
     private async onInfo(event: InfoEvent) {
         const data = event.detail
+
+        // Always mirror debug lines; the connection modal's listener is
+        // removed once the stream connects.
+        if (data.type == "addDebugLine" && data.line.trim()) {
+            queueRemoteLog(data.line.trim())
+        }
 
         if (data.type == "app") {
             const app = data.app

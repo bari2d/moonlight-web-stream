@@ -13,6 +13,7 @@ import { StreamStats } from "./stats.js"
 import { DataTransportChannel, Transport, TransportShutdown } from "./transport/index.js"
 import { WebSocketTransport } from "./transport/web_socket.js"
 import { WebTransportTransport } from "./transport/web_transport.js"
+import { filterTransportCandidates, raceCandidates, transportCandidates } from "./transport/candidates.js"
 import { WebRTCTransport } from "./transport/webrtc.js"
 import { allVideoCodecs, andVideoCodecs, createSupportedVideoFormatsBits, emptyVideoCodecs, getSelectedVideoCodec, hasAnyCodec, VideoCodecSupport } from "./video.js"
 import { VideoRenderer } from "./video/index.js"
@@ -130,7 +131,8 @@ export class Stream implements Component {
     private controlRecoveryGeneration: number | null = null
     private stopping = false
     private iceServers: Array<RTCIceServer> | null = null
-    private webTransportUrl: string | null = null
+    private webTransportUrls: string[] = []
+    private webTransportAttempt: AbortController | null = null
     private transportOverride: TransportType | null = null
     private webTransportEstablishedRetryCount = 0
     private webTransportStabilityTimer: number | null = null
@@ -158,6 +160,13 @@ export class Stream implements Component {
     private hasConnectionComplete = false
     private connectionCompleteEpoch = 0
     private connectionCompleteSetup: Promise<void> = Promise.resolve()
+    // Media setup that last completed, so a replacement native connection
+    // (adaptive bitrate) with identical parameters can tolerate a re-setup
+    // failure instead of tearing the whole transport down.
+    private lastMediaSetupKey: string | null = null
+    // Bitrate the host settled on after adaptive reductions. Later
+    // (re)connections in this tab start here instead of the full setting.
+    private adaptiveBitrateCapKbps: number | null = readAdaptiveBitrateCap()
     private hasVideoReady = false
     private hasDispatchedVideoReady = false
 
@@ -204,6 +213,7 @@ export class Stream implements Component {
         }
     }
     private resetVideoReadyState() {
+        this.lastMediaSetupKey = null
         this.connectionCompleteEpoch++
         this.hasConnectionComplete = false
         this.hasVideoReady = false
@@ -243,6 +253,13 @@ export class Stream implements Component {
 
         if ("DebugLog" in message) {
             const debugLog = message.DebugLog
+            // Sent by the streamer (restart_with_adaptive_bitrate) after a
+            // successful reduction.
+            const adaptive = /^Adaptive bitrate adjusted the stream from \d+ to (\d+) Kbps/.exec(debugLog.message)
+            if (adaptive) {
+                this.adaptiveBitrateCapKbps = Number.parseInt(adaptive[1])
+                writeAdaptiveBitrateCap(this.adaptiveBitrateCapKbps)
+            }
 
             this.debugLog(debugLog.message, {
                 type: debugLog.ty ?? undefined
@@ -312,22 +329,46 @@ export class Stream implements Component {
                 if (!this.isCurrentControlGeneration(generation)) {
                     return
                 }
-                await Promise.all([
-                    videoRenderer.setup({
+                const setupKey = JSON.stringify([
+                    format, fps, width, height,
+                    audioSampleRate, audioChannelCount, audioStreams,
+                    audioCoupledStreams, audioSamplesPerFrame, audioMapping,
+                ])
+                // Run each setup (sync or async) and capture its failure
+                // instead of letting the first one reject the whole batch.
+                const settle = (run: () => void | Promise<void>) =>
+                    Promise.resolve().then(run).then(() => null, (error: unknown) => String(error))
+                const results = await Promise.all([
+                    settle(() => videoRenderer.setup({
                         codec: format,
                         fps,
                         width,
                         height,
-                    }),
-                    audioPlayer.setup({
+                    })),
+                    settle(() => audioPlayer.setup({
                         sampleRate: audioSampleRate,
                         channels: audioChannelCount,
                         streams: audioStreams,
                         coupledStreams: audioCoupledStreams,
                         samplesPerFrame: audioSamplesPerFrame,
                         mapping: audioMapping,
-                    })
+                    })),
                 ])
+                const failures: string[] = []
+                if (results[0] != null) failures.push(`video: ${results[0]}`)
+                if (results[1] != null) failures.push(`audio: ${results[1]}`)
+                if (failures.length > 0) {
+                    if (this.lastMediaSetupKey != setupKey) {
+                        throw new Error(`Media setup failed: ${failures.join("; ")}`)
+                    }
+                    // Same codec/size/audio layout as the running pipeline
+                    // (e.g. an adaptive bitrate reconnect). Keep it; the IDR
+                    // requested below resynchronizes the decoder. iOS
+                    // Safari's worker pipeline rejects re-setup of a live
+                    // pipeline, which used to kill the whole transport.
+                    this.debugLog(`Media re-setup failed for an unchanged stream; keeping the existing pipeline (${failures.join("; ")})`)
+                }
+                this.lastMediaSetupKey = setupKey
             })
             this.connectionCompleteSetup = setupResult.catch(() => { })
             await setupResult
@@ -359,7 +400,15 @@ export class Stream implements Component {
         // The authenticated control socket provides a one-time WebTransport URL
         // before the streamer Setup message triggers transport selection.
         else if ("WebTransportSetup" in message) {
-            this.webTransportUrl = message.WebTransportSetup.url
+            const candidates = transportCandidates(message.WebTransportSetup.url, message.WebTransportSetup.urls)
+            this.webTransportUrls = filterTransportCandidates(
+                candidates,
+                this.settings.webTransportHost,
+                this.settings.webTransportPort,
+            )
+            this.debugLog(
+                `WebTransport route preference selected ${this.webTransportUrls.length}/${candidates.length} endpoint(s): host=${this.settings.webTransportHost}, port=${this.settings.webTransportPort}`,
+            )
         }
         // -- WebRTC Config
         else if ("Setup" in message) {
@@ -739,7 +788,8 @@ export class Stream implements Component {
         this.connectionCompleteSetup = Promise.resolve()
         // WebTransport URLs are one-use authenticated tokens. Retire the old
         // socket's setup state at the same instant as its generation.
-        this.webTransportUrl = null
+        this.webTransportAttempt?.abort()
+        this.webTransportUrls = []
         this.iceServers = null
         this.wsSendBuffer.length = 0
         this.clearWebTransportControl()
@@ -1124,7 +1174,7 @@ export class Stream implements Component {
             this.debugLog("Not trying WebTransport because permissions disallow browser relay transports")
             return "failednoconnect"
         }
-        if (!this.webTransportUrl) {
+        if (this.webTransportUrls.length == 0) {
             this.debugLog("WebTransport is not enabled on this server")
             return "failednoconnect"
         }
@@ -1133,22 +1183,31 @@ export class Stream implements Component {
             return "failednoconnect"
         }
 
-        this.debugLog("Trying WebTransport")
-        const transport = new WebTransportTransport(this.webTransportUrl, this.logger)
-        const shutdown = new Promise<TransportShutdown>((resolve) => {
-            transport.onclose = (reason) => {
-                transport.onclose = null
-                resolve(reason)
+        this.debugLog(`Trying ${this.webTransportUrls.length} WebTransport endpoint(s)`)
+        this.webTransportAttempt?.abort()
+        const attempt = new AbortController()
+        this.webTransportAttempt = attempt
+        const winner = await raceCandidates(this.webTransportUrls, url => {
+            const transport = new WebTransportTransport(url, this.logger)
+            const shutdown = new Promise<TransportShutdown>(resolve => {
+                transport.onclose = reason => {
+                    transport.onclose = null
+                    resolve(reason)
+                }
+            })
+            return {
+                transport, shutdown,
+                connect: (timeout: number) => transport.connect(timeout),
+                close: () => transport.close(),
             }
-        })
-
-        try {
-            await transport.connect(WEBTRANSPORT_CONNECT_TIMEOUT_MS)
-        } catch (error) {
-            this.debugLog(`WebTransport connection failed: ${error instanceof Error ? error.message : String(error)}`)
-            await transport.close()
-            return "failednoconnect"
-        }
+        }, attempt.signal, (url, result) => {
+            // Only log host/port: the query contains a one-use bearer token.
+            const endpoint = new URL(url)
+            this.debugLog(`WebTransport ${endpoint.hostname}:${endpoint.port || "443"}: ${result}`)
+        }, WEBTRANSPORT_CONNECT_TIMEOUT_MS)
+        if (this.webTransportAttempt === attempt) this.webTransportAttempt = null
+        if (!winner) return this.isCurrentControlGeneration(generation) ? "failednoconnect" : "disconnect"
+        const { transport, shutdown } = winner
 
         if (!this.isCurrentControlGeneration(generation)) {
             await transport.close()
@@ -1297,7 +1356,8 @@ export class Stream implements Component {
             supportedVideoCodecs: andVideoCodecs(codecHint, transportCodecSupport),
             canvasRenderer: this.settings.canvasRenderer,
             forceVideoElementRenderer: this.settings.forceVideoElementRenderer,
-            canvasVsync: this.settings.canvasVsync
+            canvasVsync: this.settings.canvasVsync,
+            framePacing: this.settings.videoFramePacing ?? "balanced",
         }
 
         let pipelineCodecSupport
@@ -1318,6 +1378,7 @@ export class Stream implements Component {
             })
 
             this.videoRenderer = videoRenderer
+            this.lastMediaSetupKey = null
         } else if (video.type == "data") {
             const { videoRenderer, supportedCodecs, error } = await buildVideoPipeline("data", videoSettings, this.logger)
 
@@ -1339,6 +1400,7 @@ export class Stream implements Component {
             })
 
             this.videoRenderer = videoRenderer
+            this.lastMediaSetupKey = null
         } else {
             this.debugLog(`Failed to create video pipeline with transport channel of type ${video.type} (${this.transport.implementationName})`)
             return null
@@ -1385,6 +1447,7 @@ export class Stream implements Component {
             audio.addTrackListener((track) => audioPlayer.setTrack(track))
 
             this.audioPlayer = audioPlayer
+            this.lastMediaSetupKey = null
         } else if (audio.type == "data") {
             const { audioPlayer, error } = await buildAudioPipeline("data", this.settings, this.logger)
 
@@ -1399,6 +1462,7 @@ export class Stream implements Component {
             })
 
             this.audioPlayer = audioPlayer
+            this.lastMediaSetupKey = null
         } else {
             this.debugLog(`Cannot find audio pipeline for transport type "${audio.type}"`)
             return false
@@ -1406,12 +1470,22 @@ export class Stream implements Component {
 
         return true
     }
+    private effectiveStartBitrateKbps(): number {
+        const cap = this.adaptiveBitrateCapKbps
+        if (!this.settings.adaptiveBitrate || cap == null || cap >= this.settings.bitrate) {
+            return this.settings.bitrate
+        }
+        const bitrate = Math.max(cap, this.settings.minimumBitrate)
+        this.debugLog(`Starting at ${bitrate} Kbps, where adaptive bitrate last settled (setting: ${this.settings.bitrate} Kbps)`)
+        return bitrate
+    }
+
     private async startStream(
         videoCodecSupport: VideoCodecSupport,
         generation = this.controlGeneration,
     ): Promise<boolean> {
         const settings: StreamSettings = {
-            bitrate_kbps: this.settings.bitrate,
+            bitrate_kbps: this.effectiveStartBitrateKbps(),
             adaptive_bitrate: this.settings.adaptiveBitrate,
             minimum_bitrate_kbps: this.settings.minimumBitrate,
             fps: this.settings.fps,
@@ -1559,6 +1633,7 @@ export class Stream implements Component {
         // continuation before this method can await or return.
         const stopSent = this.sendGeneralMessage("Stop")
         this.controlGeneration++
+        this.webTransportAttempt?.abort()
         this.clearWebTransportControl()
         this.clearWebTransportStabilityTimer()
         this.clearWebTransportReprobeTimer()
@@ -1595,4 +1670,29 @@ export class Stream implements Component {
 
 function createPrettyList(list: Array<string>): string {
     return `[${list.join(", ")}]`
+}
+
+// The adaptive cap lives in sessionStorage: it survives reconnects and reloads
+// within the tab (the network is likely the same) but not a fresh visit.
+const ADAPTIVE_CAP_KEY = "mlw-adaptive-bitrate-cap"
+const ADAPTIVE_CAP_MAX_AGE_MS = 15 * 60 * 1000
+function readAdaptiveBitrateCap(): number | null {
+    try {
+        const raw = sessionStorage.getItem(ADAPTIVE_CAP_KEY)
+        if (!raw) {
+            return null
+        }
+        const { kbps, at } = JSON.parse(raw)
+        if (typeof kbps != "number" || typeof at != "number" || Date.now() - at > ADAPTIVE_CAP_MAX_AGE_MS) {
+            return null
+        }
+        return kbps
+    } catch (_error) {
+        return null
+    }
+}
+function writeAdaptiveBitrateCap(kbps: number) {
+    try {
+        sessionStorage.setItem(ADAPTIVE_CAP_KEY, JSON.stringify({ kbps, at: Date.now() }))
+    } catch (_error) { }
 }

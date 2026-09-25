@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use common::{
     api_bindings::{
         GeneralClientMessage, GeneralServerMessage, LogMessageType, StreamClientMessage,
@@ -53,14 +54,14 @@ use tokio::{
     io::{stdin, stdout},
     runtime::Handle,
     spawn,
-    sync::{Mutex, Notify, RwLock, oneshot, watch},
+    sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch},
     task::spawn_blocking,
     time::{sleep, timeout},
 };
 use tracing::{Level, level_filters::LevelFilter, span};
 use tracing::{debug, error, info, trace, warn};
 
-use common::api_bindings::{StreamCapabilities, StreamServerMessage};
+use common::api_bindings::{StreamCapabilities, StreamServerMessage, StreamerStatsUpdate};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
@@ -81,6 +82,10 @@ const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_START_TIMEOUT: Duration = Duration::from_secs(10);
 const IPC_STOP_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
+// Native Moonlight invokes audio on its receive thread. Never make that thread
+// wait for Tokio or transport locks: doing so fills Moonlight's fixed packet
+// queue and loses a burst of stateful Opus frames.
+const AUDIO_DISPATCH_QUEUE_CAPACITY: usize = 8;
 
 mod adaptive_bitrate;
 mod audio;
@@ -201,6 +206,9 @@ async fn main() {
     // commonly listens only on IPv4, and the refused IPv6 attempt can stall a
     // reconnect for seconds before the equivalent IPv4 loopback succeeds.
     let host_address = normalize_loopback_host(host_address);
+    HOST_IS_LOCAL
+        .set(host_is_local(&host_address))
+        .ok();
 
     // -- Create the host and pair it
     let host = MoonlightHost::new(host_address, host_http_port, client_unique_id)
@@ -486,6 +494,19 @@ struct AdaptiveRestartPendingGuard<'a> {
     pending: &'a AtomicBool,
 }
 
+/// Whether Sunshine runs on this machine or the LAN. moonlight-common's Auto
+/// mode treats 127.0.0.1 as remote, which costs 500 Kbps of bitrate, disables
+/// QoS (DSCP) tagging and can lower audio quality.
+static HOST_IS_LOCAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn host_is_local(host_address: &str) -> bool {
+    match host_address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+        Err(_) => false,
+    }
+}
+
 fn normalize_loopback_host(host_address: String) -> String {
     if host_address.eq_ignore_ascii_case("localhost") {
         "127.0.0.1".to_owned()
@@ -628,6 +649,7 @@ struct StreamConnection {
     native_input_replay_pending: AtomicBool,
     pub active_gamepads: RwLock<ActiveGamepads>,
     pub transport_sender: Mutex<Option<SharedTransportSender>>,
+    pub(crate) audio_dispatch_tx: mpsc::Sender<(u64, Bytes)>,
     transport_dispatch: RwLock<()>,
     transport_generation: AtomicU64,
     transport_cancel: Mutex<Option<oneshot::Sender<()>>>,
@@ -649,6 +671,8 @@ impl StreamConnection {
         audio_sample_queue_size: usize,
         permissions: StreamPermissions,
     ) -> Result<Arc<Self>, anyhow::Error> {
+        let (audio_dispatch_tx, mut audio_dispatch_rx) =
+            mpsc::channel::<(u64, Bytes)>(AUDIO_DISPATCH_QUEUE_CAPACITY);
         let this = Arc::new(Self {
             runtime: Handle::current(),
             moonlight,
@@ -680,6 +704,7 @@ impl StreamConnection {
             native_input_replay_pending: AtomicBool::new(false),
             active_gamepads: RwLock::new(ActiveGamepads::empty()),
             transport_sender: Mutex::new(None),
+            audio_dispatch_tx,
             transport_dispatch: RwLock::new(()),
             transport_generation: AtomicU64::new(0),
             transport_cancel: Mutex::new(None),
@@ -687,6 +712,32 @@ impl StreamConnection {
             terminate: Notify::default(),
             is_terminating: AtomicBool::new(false),
             termination_signal: watch::channel(false).0,
+        });
+
+        // Preserve audio ordering on one async task while keeping the native
+        // callback entirely non-blocking. Generation checks discard packets
+        // left behind by an adaptive reconnect before they reach a new stream.
+        spawn({
+            let this = Arc::downgrade(&this);
+            async move {
+                while let Some((generation, data)) = audio_dispatch_rx.recv().await {
+                    let Some(this) = this.upgrade() else {
+                        return;
+                    };
+                    if !this.is_native_media_ready(generation) {
+                        continue;
+                    }
+                    let sender = this.transport_sender.lock().await.clone();
+                    if !this.is_native_media_ready(generation) {
+                        continue;
+                    }
+                    if let Some(sender) = sender
+                        && let Err(err) = sender.send_audio_sample(&data).await
+                    {
+                        warn!("Failed to send audio sample: {err}");
+                    }
+                }
+            }
         });
 
         spawn({
@@ -1269,9 +1320,22 @@ impl StreamConnection {
     }
 
     async fn on_network_feedback(self: &Arc<Self>, feedback: NetworkFeedback) {
-        if !self.adaptive_transport_active.load(Ordering::Acquire)
-            || self.is_terminating.load(Ordering::Acquire)
-        {
+        if self.is_terminating.load(Ordering::Acquire) {
+            return;
+        }
+        // Surface the QUIC path RTT next to the application-level browser RTT
+        // so a jumping number can be attributed to the network or the browser.
+        if feedback.rtt_ms > 0 {
+            self.try_send_packet(
+                OutboundPacket::Stats(StreamerStatsUpdate::TransportRtt {
+                    rtt_ms: f64::from(feedback.rtt_ms),
+                }),
+                "transport rtt stats",
+                false,
+            )
+            .await;
+        }
+        if !self.adaptive_transport_active.load(Ordering::Acquire) {
             return;
         }
 
@@ -1886,7 +1950,11 @@ impl StreamConnection {
             bitrate: stream_settings.bitrate_kbps,
             packet_size: 1024,
             encryption_flags,
-            streaming_remotely: StreamingConfig::Auto,
+            streaming_remotely: if HOST_IS_LOCAL.get().copied().unwrap_or(false) {
+                StreamingConfig::Local
+            } else {
+                StreamingConfig::Auto
+            },
             sops: true,
             supported_video_formats: VideoFormats::from_bits_truncate(
                 stream_settings.supported_codecs,

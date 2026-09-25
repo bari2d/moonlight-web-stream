@@ -402,12 +402,8 @@ impl AuthenticatedUser {
         })
     }
 
-    pub async fn host_delete(&mut self, host_id: HostId) -> Result<(), AppError> {
-        let host = self.host(host_id).await?;
-
-        host.delete(self).await?;
-
-        Ok(())
+    pub async fn host_delete(&mut self, _host_id: HostId) -> Result<(), AppError> {
+        Err(AppError::Forbidden)
     }
 
     pub async fn into_admin(self) -> Result<Admin, AppError> {

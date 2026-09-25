@@ -1,5 +1,6 @@
 use std::sync::Weak;
 
+use bytes::Bytes;
 use log::{debug, error, warn};
 use moonlight_common::stream::audio::{
     AudioConfig, AudioDecoder, AudioFrame, OpusMultistreamConfig,
@@ -61,24 +62,16 @@ impl AudioDecoder for StreamAudioDecoder {
             return;
         }
 
-        let generation = self.generation;
-        stream.runtime.clone().block_on(async move {
-            if !stream.is_native_media_ready(generation) {
-                return;
+        let packet = (self.generation, Bytes::copy_from_slice(sample.buffer));
+        match stream.audio_dispatch_tx.try_send(packet) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!("Audio dispatch queue overflow; dropping newest packet");
             }
-            let sender = {
-                let sender = stream.transport_sender.lock().await;
-                sender.clone()
-            };
-
-            if let Some(sender) = sender {
-                if let Err(err) = sender.send_audio_sample(sample.buffer).await {
-                    warn!("Failed to send audio sample: {err}");
-                }
-            } else {
-                debug!("Dropping audio packet because of missing transport");
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                debug!("Dropping audio packet because dispatch is closed");
             }
-        });
+        }
     }
 
     fn config(&self) -> AudioConfig {

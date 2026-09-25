@@ -11,7 +11,7 @@ import { CanvasFrameDrawPipe, CanvasRgbaFrameDrawPipe, CanvasYuv420FrameDrawPipe
 import { DepacketizeVideoPipe } from "../video/depackitize_pipe.js";
 import { VideoMediaStreamTrackGeneratorPipe } from "../video/media_stream_track_generator_pipe.js";
 import { VideoMediaStreamTrackProcessorPipe } from "../video/media_stream_track_processor_pipe.js";
-import { WorkerDataToCanvasGlRenderOpenH264Pipe, WorkerDataToVideoTrackPipe, WorkerVideoMediaStreamProcessorCanvasPipe, WorkerVideoMediaStreamProcessorPipe } from "../video/pipeline.js";
+import { WorkerDataToCanvasGlRenderOpenH264Pipe, WorkerDataToCanvasPipe, WorkerDataToVideoTrackPipe, WorkerVideoMediaStreamProcessorCanvasPipe, WorkerVideoMediaStreamProcessorPipe } from "../video/pipeline.js";
 import { VideoDecoderPipe } from "../video/video_decoder_pipe.js";
 import { VideoTrackGeneratorPipe } from "../video/video_track_generator.js";
 import { WorkerDataReceivePipe, WorkerDataSendPipe, WorkerOffscreenCanvasSendPipe, WorkerVideoDataReceivePipe, WorkerVideoDataSendPipe, WorkerVideoFrameReceivePipe, WorkerVideoFrameSendPipe, WorkerVideoTrackReceivePipe, WorkerVideoTrackSendPipe } from "./worker_io.js";
@@ -156,6 +156,7 @@ export function pipes(): Array<PipeStatic> {
         WorkerOffscreenCanvasSendPipe,
         WorkerVideoMediaStreamProcessorCanvasPipe,
         WorkerDataToVideoTrackPipe,
+        WorkerDataToCanvasPipe,
         WorkerDataToCanvasGlRenderOpenH264Pipe,
         // Audio
         DepacketizeAudioPipe,

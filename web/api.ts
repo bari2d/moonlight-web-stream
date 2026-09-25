@@ -182,23 +182,24 @@ class StreamedJsonResponse<Initial, Other> {
 
     async next(): Promise<Other | null> {
         while (true) {
+            // Several lines can arrive in one chunk (e.g. coalesced by the
+            // Cloudflare tunnel). Serve buffered lines before reading more;
+            // the old split("\n", 2) silently dropped the remainder.
+            const newline = this.bufferedText.indexOf("\n")
+            if (newline != -1) {
+                const text = this.bufferedText.slice(0, newline)
+                this.bufferedText = this.bufferedText.slice(newline + 1)
+
+                return JSON.parse(text)
+            }
+
             const { done, value } = await this.reader.read()
 
             if (done) {
                 return null
             }
 
-            this.bufferedText += this.decoder.decode(value)
-
-            const split = this.bufferedText.split("\n", 2)
-            if (split.length == 2) {
-                this.bufferedText = split[1]
-
-                const text = split[0]
-                const json = JSON.parse(text)
-
-                return json
-            }
+            this.bufferedText += this.decoder.decode(value, { stream: true })
         }
     }
 }

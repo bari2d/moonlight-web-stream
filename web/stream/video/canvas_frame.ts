@@ -5,7 +5,8 @@ import { Pipe, PipeInfo } from "../pipeline/index.js"
 import { addPipePassthrough } from "../pipeline/pipes.js"
 import { allVideoCodecs } from "../video.js"
 import { CanvasVideoRendererOptions } from "./canvas.js"
-import { CanvasRenderer, FrameVideoRenderer, VideoRendererSetup, RgbaFrameVideoRenderer, RgbaVideoFrame, Yuv420FrameVideoRenderer, Yuv420VideoFrame } from "./index.js"
+import { CanvasRenderer, FramePacingMode, FrameVideoRenderer, VideoRendererSetup, RgbaFrameVideoRenderer, RgbaVideoFrame, Yuv420FrameVideoRenderer, Yuv420VideoFrame } from "./index.js"
+import { StatValue } from "../stats.js"
 
 abstract class BaseCanvasFrameDrawPipe implements Pipe {
 
@@ -82,6 +83,179 @@ abstract class BaseCanvasFrameDrawPipe implements Pipe {
     }
 }
 
+type PacingProfile = {
+    /// Longest extra hold the buffer may add, in frame intervals.
+    maxDelayFrames: number
+    /// Decoded frames kept alive at once. Hardware decoders own a small output
+    /// pool, so this stays well below typical pool sizes.
+    maxQueuedFrames: number
+}
+
+const PACING_PROFILES: Record<Exclude<FramePacingMode, "off">, PacingProfile> = {
+    balanced: { maxDelayFrames: 2, maxQueuedFrames: 3 },
+    smooth: { maxDelayFrames: 4, maxQueuedFrames: 5 },
+}
+// The arrival-offset floor may creep up this much per frame so a browser
+// clock that runs slightly fast relative to the host does not make every
+// frame look late forever (0.02 ms/frame covers ~1200 ppm at 60 fps).
+const PACING_FLOOR_DRIFT_MS_PER_FRAME = 0.02
+// How quickly the jitter allowance relaxes once arrivals calm down.
+const PACING_DELAY_DECAY_MS_PER_FRAME = 0.05
+const PACING_DEFAULT_REFRESH_MS = 1000 / 60
+
+type FrameCallbackHandle = { cancel: () => void }
+
+function requestFrameCallback(callback: (nowMs: number) => void): FrameCallbackHandle {
+    const global = globalObject() as {
+        requestAnimationFrame?: (callback: FrameRequestCallback) => number
+        cancelAnimationFrame?: (handle: number) => void
+    }
+    if (typeof global.requestAnimationFrame == "function" && typeof global.cancelAnimationFrame == "function") {
+        const handle = global.requestAnimationFrame(callback)
+        return { cancel: () => global.cancelAnimationFrame!(handle) }
+    }
+    // Workers without requestAnimationFrame: poll a little faster than a
+    // 120 Hz display would.
+    const handle = setTimeout(() => callback(performance.now()), 4)
+    return { cancel: () => clearTimeout(handle) }
+}
+
+function closeFrameQuietly(frame: VideoFrame): void {
+    try {
+        frame.close()
+    } catch (_error) {
+        // Already closed by the decoder or a transfer.
+    }
+}
+
+/**
+ * Small adaptive jitter buffer between the decoder and the canvas.
+ *
+ * Frames arrive with network jitter but carry the host's capture timestamps.
+ * The pacer maps those timestamps onto the local clock (the smallest observed
+ * arrival offset is the "on time" reference), adds a jitter allowance that
+ * tracks how late frames have recently been, and presents each frame on the
+ * display refresh at which it becomes due. Frames that are already overdue
+ * are skipped in favour of the newest due frame, so a burst after a stall is
+ * caught up instead of replayed, and the allowance is capped so the buffer
+ * can never add more than a couple of frame intervals of latency.
+ */
+class VideoFramePacer {
+    private readonly queue: Array<VideoFrame> = []
+    private floorOffsetMs: number | null = null
+    private targetDelayMs = 0
+    private frameIntervalMs = PACING_DEFAULT_REFRESH_MS
+    private refreshIntervalMs = PACING_DEFAULT_REFRESH_MS
+    private lastTickMs: number | null = null
+    private pending: FrameCallbackHandle | null = null
+
+    framesPresented = 0
+    framesDropped = 0
+
+    constructor(
+        private readonly profile: PacingProfile,
+        private readonly present: (frame: VideoFrame) => void,
+    ) { }
+
+    setFrameRate(fps: number): void {
+        if (fps > 0) {
+            this.frameIntervalMs = 1000 / fps
+        }
+    }
+
+    get delayMs(): number {
+        return this.targetDelayMs
+    }
+
+    get queuedFrames(): number {
+        return this.queue.length
+    }
+
+    push(frame: VideoFrame, nowMs: number): void {
+        const timestampMs = frame.timestamp / 1000
+        const offsetMs = nowMs - timestampMs
+        if (this.floorOffsetMs == null || offsetMs < this.floorOffsetMs) {
+            this.floorOffsetMs = offsetMs
+        } else {
+            this.floorOffsetMs += PACING_FLOOR_DRIFT_MS_PER_FRAME
+        }
+        const jitterMs = Math.max(0, offsetMs - this.floorOffsetMs)
+        const maxDelayMs = this.profile.maxDelayFrames * this.frameIntervalMs
+        this.targetDelayMs = Math.min(
+            maxDelayMs,
+            Math.max(jitterMs, this.targetDelayMs - PACING_DELAY_DECAY_MS_PER_FRAME),
+        )
+
+        this.queue.push(frame)
+        while (this.queue.length > this.profile.maxQueuedFrames) {
+            const dropped = this.queue.shift()
+            if (dropped) {
+                closeFrameQuietly(dropped)
+                this.framesDropped++
+            }
+        }
+        this.schedule()
+    }
+
+    clear(): void {
+        if (this.pending) {
+            this.pending.cancel()
+            this.pending = null
+        }
+        for (const frame of this.queue.splice(0)) {
+            closeFrameQuietly(frame)
+        }
+        this.floorOffsetMs = null
+        this.targetDelayMs = 0
+        this.lastTickMs = null
+    }
+
+    private schedule(): void {
+        if (this.pending != null || this.queue.length == 0) {
+            return
+        }
+        this.pending = requestFrameCallback(this.onTick)
+    }
+
+    private dueTimeMs(frame: VideoFrame): number {
+        return frame.timestamp / 1000 + (this.floorOffsetMs ?? 0) + this.targetDelayMs
+    }
+
+    private readonly onTick = (nowMs: number) => {
+        this.pending = null
+        if (this.lastTickMs != null) {
+            const delta = nowMs - this.lastTickMs
+            if (delta > 1 && delta < 100) {
+                this.refreshIntervalMs = this.refreshIntervalMs * 0.9 + delta * 0.1
+            }
+        }
+        this.lastTickMs = nowMs
+
+        // Anything due before the next refresh is presented now; of several
+        // due frames only the newest is shown and the rest are skipped.
+        const horizonMs = nowMs + this.refreshIntervalMs / 2
+        let dueIndex = -1
+        for (let index = 0; index < this.queue.length; index++) {
+            if (this.dueTimeMs(this.queue[index]) <= horizonMs) {
+                dueIndex = index
+            } else {
+                break
+            }
+        }
+        if (dueIndex >= 0) {
+            for (let index = 0; index < dueIndex; index++) {
+                closeFrameQuietly(this.queue[index])
+                this.framesDropped++
+            }
+            const frame = this.queue[dueIndex]
+            this.queue.splice(0, dueIndex + 1)
+            this.framesPresented++
+            this.present(frame)
+        }
+        this.schedule()
+    }
+}
+
 export class CanvasFrameDrawPipe extends BaseCanvasFrameDrawPipe implements FrameVideoRenderer {
 
     static async getInfo(): Promise<PipeInfo> {
@@ -95,18 +269,44 @@ export class CanvasFrameDrawPipe extends BaseCanvasFrameDrawPipe implements Fram
     static readonly type = "videoframe"
 
     private currentFrame: VideoFrame | null = null
+    private readonly pacer: VideoFramePacer | null
+    private readonly pacingMode: FramePacingMode
 
     constructor(base: CanvasRenderer, _logger?: unknown, options?: unknown) {
         super(`canvas_frame -> ${base.implementationName}`, base, _logger, options)
 
+        const opts = options as CanvasVideoRendererOptions | undefined
+        this.pacingMode = opts?.framePacing ?? "off"
+        this.pacer = this.pacingMode == "off"
+            ? null
+            : new VideoFramePacer(PACING_PROFILES[this.pacingMode], frame => this.presentPacedFrame(frame))
+
         addPipePassthrough(this)
     }
 
+    async setup(setup: VideoRendererSetup): Promise<void> {
+        this.pacer?.clear()
+        this.pacer?.setFrameRate(setup.fps)
+        return super.setup(setup)
+    }
+
     submitFrame(frame: VideoFrame): void {
+        if (this.pacer) {
+            this.pacer.push(frame, performance.now())
+            return
+        }
+
         this.currentFrame?.close()
 
         this.currentFrame = frame
         this.onFrameSubmitted()
+    }
+
+    private presentPacedFrame(frame: VideoFrame): void {
+        this.currentFrame?.close()
+        this.currentFrame = frame
+        // Called from the display refresh callback, so draw straight away.
+        this.drawCurrentFrameIfReady()
     }
 
     /** Draw currentFrame to canvas if context and frame are ready. Only updates size when dimensions change. */
@@ -129,7 +329,23 @@ export class CanvasFrameDrawPipe extends BaseCanvasFrameDrawPipe implements Fram
         frame.close()
     }
 
+    async reportStats(statsObject: Record<string, StatValue>): Promise<void> {
+        statsObject.canvasFramePacing = this.pacingMode
+        if (this.pacer) {
+            statsObject.canvasPacingDelayMs = Math.round(this.pacer.delayMs * 10) / 10
+            statsObject.canvasPacingQueuedFrames = this.pacer.queuedFrames
+            statsObject.canvasPacingFramesPresented = this.pacer.framesPresented
+            statsObject.canvasPacingFramesSkipped = this.pacer.framesDropped
+        }
+
+        const base = this.base as { reportStats?: (statsObject: Record<string, StatValue>) => Promise<void> | void }
+        if (typeof base.reportStats == "function") {
+            await base.reportStats(statsObject)
+        }
+    }
+
     cleanup() {
+        this.pacer?.clear()
         this.currentFrame?.close()
         this.currentFrame = null
         return super.cleanup()

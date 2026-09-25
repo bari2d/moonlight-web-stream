@@ -386,8 +386,9 @@ pub async fn start_host(
                                     (None, _) => None,
                                 };
 
-                                let setup_url =
-                                    bridge.as_ref().map(|bridge| bridge.setup_url.clone());
+                                let setup_urls = bridge.as_ref().map(|bridge| {
+                                    (bridge.setup_url.clone(), bridge.setup_urls.clone())
+                                });
                                 web_transport_outbound =
                                     bridge.as_ref().map(|bridge| bridge.outbound.clone());
 
@@ -402,7 +403,7 @@ pub async fn start_host(
                                     break 'forwarding;
                                 }
 
-                                if let Some(url) = setup_url {
+                                if let Some((url, urls)) = setup_urls {
                                     let send_result = tokio::select! {
                                         biased;
                                         _ = wait_for_shutdown(&mut session_shutdown_rx) => {
@@ -411,7 +412,7 @@ pub async fn start_host(
                                         }
                                         result = send_ws_message(
                                             &mut session,
-                                            StreamServerMessage::WebTransportSetup { url },
+                                            StreamServerMessage::WebTransportSetup { url, urls },
                                         ) => result,
                                     };
                                     if send_result.is_err() {

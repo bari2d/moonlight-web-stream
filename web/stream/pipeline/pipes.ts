@@ -12,7 +12,9 @@ export function addPipePassthrough(pipe: Pipe, overwrite?: Array<string>) {
         }
         pipeAny[name] = function () {
             const base = pipe.getBase() as any
-            if (base) {
+            // Chains can end in pipes without the optional methods (for
+            // example the worker message sender); treat those as no-ops.
+            if (base && typeof base[name] == "function") {
                 return base[name].apply(base, arguments)
             }
         }

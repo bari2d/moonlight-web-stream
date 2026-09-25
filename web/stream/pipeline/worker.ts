@@ -23,6 +23,32 @@ logger?.addInfoListener(onLog)
 let pipelineErrored = false
 let currentPipeline: WorkerReceiver | null = null
 let canvasPipe: WorkerOffscreenCanvasSendPipe | null = null
+let idrPollInterval: ReturnType<typeof setInterval> | null = null
+
+// Decoder pipes inside the worker can demand a key frame (for example after
+// a backlog reset). The main thread cannot poll them directly, so relay the
+// request as an output message that the WorkerPipe reports from its own
+// pollRequestIdr.
+const WORKER_IDR_POLL_INTERVAL_MS = 50
+function startIdrRelay() {
+    if (idrPollInterval != null) {
+        clearInterval(idrPollInterval)
+    }
+    idrPollInterval = setInterval(() => {
+        const pipeline = currentPipeline as (WorkerReceiver & { pollRequestIdr?: () => boolean }) | null
+        if (!pipeline || pipelineErrored || typeof pipeline.pollRequestIdr != "function") {
+            return
+        }
+        try {
+            if (pipeline.pollRequestIdr() === true) {
+                const message: ToMainMessage = { output: { requestIdr: true } }
+                postMessage(message)
+            }
+        } catch (error) {
+            logger.debug(`Failed to poll the worker pipeline for an IDR request: ${String(error)}`)
+        }
+    }, WORKER_IDR_POLL_INTERVAL_MS)
+}
 
 class WorkerMessageSender implements WorkerReceiver {
     static readonly type: string = "workerinput"
@@ -90,6 +116,7 @@ async function onMessage(message: ToWorkerMessage) {
             logger.debug("Failed to build worker pipeline!", { type: "fatal" })
         }
         logger.debug(`Successfully build pipeline in worker: ${currentPipeline?.implementationName}`)
+        startIdrRelay()
 
         let base = newPipeline
         let newBase = newPipeline?.getBase()

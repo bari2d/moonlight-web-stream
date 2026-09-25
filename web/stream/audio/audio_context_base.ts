@@ -27,9 +27,23 @@ export abstract class AudioContextBasePipe implements NodeAudioPlayer {
 
     setup(setup: AudioPlayerSetup) {
         // Adaptive bitrate changes reconnect the native media session while the
-        // browser pipeline stays alive. Release the previous context before
-        // replacing it so every reconnect does not leave an audio device and
-        // rendering graph running in the background.
+        // browser pipeline stays alive. Keep the running context when the
+        // sample rate is unchanged: its nodes stay valid (mixing nodes from two
+        // contexts throws InvalidAccessError) and iOS Safari would start a
+        // replacement context suspended until the next user gesture.
+        if (
+            this.audioContext &&
+            this.audioContext.state != "closed" &&
+            this.audioContext.sampleRate == setup.sampleRate
+        ) {
+            if (this.base && "setup" in this.base && typeof this.base.setup == "function") {
+                return this.base.setup(...arguments)
+            }
+            return
+        }
+        // Otherwise release the previous context before replacing it so every
+        // reconnect does not leave an audio device and rendering graph running
+        // in the background.
         if (this.audioContext) {
             void this.audioContext.close()
             this.audioContext = null

@@ -135,14 +135,10 @@ async fn patch_host(
 
 #[delete("/host")]
 async fn delete_host(
-    mut user: AuthenticatedUser,
-    Query(query): Query<DeleteHostQuery>,
+    _user: AuthenticatedUser,
+    Query(_query): Query<DeleteHostQuery>,
 ) -> Result<HttpResponse, AppError> {
-    let host_id = HostId(query.host_id);
-
-    user.host_delete(host_id).await?;
-
-    Ok(HttpResponse::Ok().finish())
+    Err(AppError::Forbidden)
 }
 
 #[post("/pair")]

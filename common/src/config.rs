@@ -59,27 +59,121 @@ pub struct WebTransportConfig {
     pub enabled: bool,
     #[serde(default = "default_web_transport_bind_address")]
     pub bind_address: SocketAddr,
+    /// Extra UDP listeners. All listeners share the one-use bridge registry.
+    #[serde(default)]
+    pub additional_bind_addresses: Vec<SocketAddr>,
     #[serde(default)]
     pub public_url: String,
+    /// Ordered alternatives, including any desired hostname/port combinations.
+    #[serde(default)]
+    pub alternate_public_urls: Vec<String>,
+    #[serde(default)]
+    pub additional_tls_identities: Vec<WebTransportTlsIdentity>,
     #[serde(default)]
     pub certificate_pem: String,
     #[serde(default)]
     pub private_key_pem: String,
     #[serde(default = "default_web_transport_token_ttl")]
     pub token_ttl: Duration,
+    /// Tuning for the QUIC connection that carries WebTransport media.
+    #[serde(default)]
+    pub quic: WebTransportQuicConfig,
 }
+
+/// QUIC transport tuning for the browser-facing WebTransport connection.
+///
+/// Every default reproduces Quinn's stock behaviour (what this fork shipped
+/// before tuning was added). Each knob is opt-in so changes can be A/B tested
+/// one at a time on a real link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebTransportQuicConfig {
+    /// Congestion controller for the browser connection.
+    #[serde(default)]
+    pub congestion_controller: QuicCongestionController,
+    /// Initial congestion window in bytes. `0` keeps Quinn's default (about
+    /// 14 KiB, so a key frame is paced over several round trips). Larger
+    /// values send a whole key frame as one burst; wireless links may drop
+    /// part of such bursts.
+    #[serde(default)]
+    pub initial_window_bytes: u64,
+    /// Round-trip estimate used until the first measurement. `0` keeps
+    /// Quinn's default (333 ms).
+    #[serde(default)]
+    pub initial_rtt_ms: u64,
+    /// Ask the browser (QUIC ACK-frequency extension) to delay its ACKs by at
+    /// most this long. `0` (default) sends no request. Browsers that do not
+    /// support the extension ignore it.
+    #[serde(default)]
+    pub requested_max_ack_delay_ms: u64,
+    /// Round-robin between equal-priority streams (Quinn default, `true`).
+    /// `false` drains each stream to completion before starting the next one.
+    #[serde(default = "default_true")]
+    pub stream_fairness: bool,
+    /// Give newer delta frames a strictly lower stream priority than older
+    /// ones so in-flight frames are transmitted in sequence order. Off
+    /// (default) leaves all delta frames at the same priority.
+    #[serde(default)]
+    pub ordered_video_priority: bool,
+}
+
+impl Default for WebTransportQuicConfig {
+    fn default() -> Self {
+        Self {
+            congestion_controller: QuicCongestionController::default(),
+            initial_window_bytes: 0,
+            initial_rtt_ms: 0,
+            requested_max_ack_delay_ms: 0,
+            stream_fairness: true,
+            ordered_video_priority: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuicCongestionController {
+    /// Loss based. Robust everywhere; backs off on every loss burst.
+    #[default]
+    Cubic,
+    /// Model based (Quinn marks it experimental). Keeps pacing through the
+    /// random loss of a wireless link instead of halving the window.
+    Bbr,
+    /// Classic loss based controller.
+    NewReno,
+    /// Constant window (`initial_window_bytes`, default 1 MiB) that ignores
+    /// loss, like native Moonlight's uncontrolled RTP; the encoder bitrate
+    /// already bounds the send rate. A frame never waits extra round trips
+    /// because a Wi-Fi loss shrank the window of an app-limited stream.
+    Fixed,
+}
+
 
 impl Default for WebTransportConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             bind_address: default_web_transport_bind_address(),
+            additional_bind_addresses: Vec::new(),
             public_url: String::new(),
+            alternate_public_urls: Vec::new(),
+            additional_tls_identities: Vec::new(),
             certificate_pem: String::new(),
             private_key_pem: String::new(),
             token_ttl: default_web_transport_token_ttl(),
+            quic: WebTransportQuicConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebTransportTlsIdentity {
+    pub hostnames: Vec<String>,
+    pub certificate_pem: String,
+    pub private_key_pem: String,
 }
 
 fn default_web_transport_bind_address() -> SocketAddr {
@@ -405,6 +499,9 @@ mod tests {
                 .expect("default bind address should parse")
         );
         assert!(config.web_transport.public_url.is_empty());
+        assert!(config.web_transport.additional_bind_addresses.is_empty());
+        assert!(config.web_transport.alternate_public_urls.is_empty());
+        assert!(config.web_transport.additional_tls_identities.is_empty());
         assert!(config.web_transport.certificate_pem.is_empty());
         assert!(config.web_transport.private_key_pem.is_empty());
         assert_eq!(config.web_transport.token_ttl, Duration::from_secs(60));

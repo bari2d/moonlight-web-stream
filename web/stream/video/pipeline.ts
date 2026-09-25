@@ -1,6 +1,6 @@
 import { UrlVideoElementRenderer, VideoElementRenderer } from "./video_element.js"
 import { VideoMediaStreamTrackProcessorPipe } from "./media_stream_track_processor_pipe.js"
-import { TrackVideoRenderer, VideoRenderer } from "./index.js"
+import { FramePacingMode, TrackVideoRenderer, VideoRenderer } from "./index.js"
 import { VideoDecoderPipe } from "./video_decoder_pipe.js"
 import { DepacketizeVideoPipe } from "./depackitize_pipe.js"
 import { Logger } from "../log.js"
@@ -39,6 +39,8 @@ export type VideoPipelineOptions = {
     /// When false:
     /// - draw only on rAF (VSync-like, may reduce tearing).
     canvasVsync: boolean
+    /// Canvas only: adaptive jitter buffer between decoder and canvas.
+    framePacing: FramePacingMode
 }
 
 type PipelineResult<T> = { videoRenderer: T, supportedCodecs: VideoCodecSupport, error: false } | { videoRenderer: null, supportedCodecs: null, error: true }
@@ -48,6 +50,9 @@ type Pipeline = { input: string, pipes: Array<PipeStatic>, renderer: VideoRender
 export const WorkerVideoMediaStreamProcessorPipe = workerPipe("WorkerVideoMediaStreamProcessorPipe", { pipes: ["WorkerVideoTrackReceivePipe", "VideoMediaStreamTrackProcessorPipe", "WorkerVideoFrameSendPipe"] })
 export const WorkerVideoMediaStreamProcessorCanvasPipe = workerPipe("WorkerVideoMediaStreamProcessorCanvasPipe", { pipes: ["WorkerVideoTrackReceivePipe", "VideoMediaStreamTrackProcessorPipe", "CanvasFrameDrawPipe", "WorkerOffscreenCanvasSendPipe"] })
 export const WorkerDataToVideoTrackPipe = workerPipe("WorkerVideoFrameToTrackPipe", { pipes: ["WorkerVideoDataReceivePipe", "VideoDecoderPipe", "VideoTrackGeneratorPipe", "WorkerVideoTrackSendPipe"] })
+// Decode, pace and draw off the main thread so input handling and transport
+// reads never delay presentation (and vice versa).
+export const WorkerDataToCanvasPipe = workerPipe("WorkerDataToCanvasPipe", { pipes: ["WorkerVideoDataReceivePipe", "VideoDecoderPipe", "CanvasFrameDrawPipe", "WorkerOffscreenCanvasSendPipe"] })
 export const WorkerDataToCanvasGlRenderOpenH264Pipe = workerPipe("WorkerDataToCanvasGlRenderOpenH264Pipe", { pipes: ["WorkerVideoDataReceivePipe", "OpenH264DecoderPipe", "CanvasYuv420FrameDrawPipe", "WorkerOffscreenCanvasSendPipe"] })
 
 const PIPELINES: Array<Pipeline> = [
@@ -66,6 +71,8 @@ const PIPELINES: Array<Pipeline> = [
     { input: "data", pipes: [DepacketizeVideoPipe, WorkerVideoDataSendPipe, WorkerDataToVideoTrackPipe, WorkerVideoTrackReceivePipe], renderer: VideoElementRenderer },
     // Convert data -> video frame -> track (MediaStreamTrackGenerator) -> video element, Chromium
     { input: "data", pipes: [DepacketizeVideoPipe, VideoDecoderPipe, VideoMediaStreamTrackGeneratorPipe], renderer: VideoElementRenderer },
+    // Convert data -> video frame (in worker) -> canvas (in worker), browsers with a worker VideoDecoder + OffscreenCanvas
+    { input: "data", pipes: [DepacketizeVideoPipe, WorkerVideoDataSendPipe, WorkerDataToCanvasPipe], renderer: OffscreenCanvasRenderer },
     // Convert data -> video frame -> canvas, Default (Secure Context), Firefox
     { input: "data", pipes: [DepacketizeVideoPipe, VideoDecoderPipe, CanvasFrameDrawPipe], renderer: MainCanvasRenderer },
     // - OpenH264 Decoder
@@ -180,7 +187,7 @@ export async function buildVideoPipeline(type: string, settings: VideoPipelineOp
 
         // Build that pipeline
         logger?.debug(`Trying to build pipeline: ${pipeline.pipes.map(pipe => pipe.name).join(" -> ")} -> ${pipeline.renderer.name} (renderer)`)
-        const rendererOptions = { drawOnSubmit: !settings.canvasVsync }
+        const rendererOptions = { drawOnSubmit: !settings.canvasVsync, framePacing: settings.framePacing }
         const videoRenderer = buildPipeline(pipeline.renderer, { pipes: pipeline.pipes }, logger, rendererOptions)
         if (!videoRenderer) {
             logger?.debug(`Failed to build video pipeline: ${pipeline.pipes.map(pipe => pipe.name).join(" -> ")} -> ${pipeline.renderer.name} (renderer)`)

@@ -9,6 +9,11 @@ export type VideoRendererSetup = {
     fps: number
 }
 
+/// Canvas renderers only. "off" draws every decoded frame as soon as it
+/// exists; the others hold frames in a small adaptive jitter buffer and
+/// present them at their original cadence on the display refresh.
+export type FramePacingMode = "off" | "balanced" | "smooth"
+
 export interface VideoRenderer extends Component, Pipe {
     readonly implementationName: string
 

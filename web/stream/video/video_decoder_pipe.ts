@@ -8,7 +8,13 @@ import { CodecStreamTranslator, H264StreamVideoTranslator, H265StreamVideoTransl
 import { DataVideoRenderer, FrameVideoRenderer, VideoDecodeUnit, VideoRendererSetup } from "./index.js";
 
 const MAX_SETUP_BUFFERED_UNITS = 8
-const MAX_DECODE_QUEUE_DELAY_MS = 50
+const MAX_DECODE_QUEUE_DELAY_MS = 100
+// A backlog must persist this long before it's treated as stale. Key frames
+// and short network bursts briefly queue several frames; resetting on those
+// forces another (even more expensive) key frame and, on slower decoders
+// (ChromeOS, iOS), became a self-sustaining IDR storm every ~10 frames.
+const DECODE_BACKLOG_PERSIST_MS = 250
+const DECODE_BACKLOG_MIN_RESET_INTERVAL_MS = 2000
 
 export const VIDEO_DECODER_CODECS_IN_BAND: Record<keyof VideoCodecSupport, string> = {
     // avc1 = out of band config, avc3 = in band with sps, pps, idr
@@ -182,6 +188,11 @@ export class VideoDecoderPipe implements DataVideoRenderer {
     }
 
     private decoderSetupFinished = false
+    private decodeBacklogSince: number | null = null
+    // TEMP diagnostics: how far the decoder falls behind, reported every 5 s.
+    private decodeQueueMax = 0
+    private decodeQueueReportedAt = 0
+    private lastBacklogResetAt = -Infinity
     private requestedIdr = false
     private needsKeyFrame = true
     private setupBufferNeedsKeyFrame = false
@@ -310,17 +321,36 @@ export class VideoDecoderPipe implements DataVideoRenderer {
         const estimatedQueueDelayMs = this.fps > 0
             ? this.decoder.decodeQueueSize * 1000 / this.fps
             : 0
-        const maxQueuedFrames = Math.max(2, Math.ceil(this.fps * MAX_DECODE_QUEUE_DELAY_MS / 1000))
-        if (this.decoder.decodeQueueSize >= maxQueuedFrames) {
-            // Once decode work is older than the live latency budget, showing
-            // it is worse than dropping to the next independently decodable
-            // frame. Reset once and gate deltas until that key frame arrives.
-
-            if (!this.requestedIdr) {
-                requestIdr = true
-                this.reset()
+        const maxQueuedFrames = Math.max(4, Math.ceil(this.fps * MAX_DECODE_QUEUE_DELAY_MS / 1000))
+        const now = performance.now()
+        this.decodeQueueMax = Math.max(this.decodeQueueMax, this.decoder.decodeQueueSize)
+        if (now - this.decodeQueueReportedAt >= 5000) {
+            if (this.decodeQueueReportedAt != 0) {
+                this.logger?.debug(`DECODER queue now=${this.decoder.decodeQueueSize} max5s=${this.decodeQueueMax} (~${Math.round(this.decodeQueueMax * 1000 / Math.max(1, this.fps))} ms) state=${this.decoder.state} config=${JSON.stringify(this.config)}`)
             }
-            console.debug(`Requesting idr because decode queue size ${this.decoder.decodeQueueSize} represents about ${estimatedQueueDelayMs} ms`)
+            this.decodeQueueReportedAt = now
+            this.decodeQueueMax = 0
+        }
+        if (this.decoder.decodeQueueSize >= maxQueuedFrames) {
+            this.decodeBacklogSince ??= now
+            // Once decode work has been older than the live latency budget
+            // for a sustained period, showing it is worse than dropping to the
+            // next independently decodable frame. Reset once and gate deltas
+            // until that key frame arrives.
+            if (
+                !this.requestedIdr &&
+                now - this.decodeBacklogSince >= DECODE_BACKLOG_PERSIST_MS &&
+                now - this.lastBacklogResetAt >= DECODE_BACKLOG_MIN_RESET_INTERVAL_MS
+            ) {
+                const queued = this.decoder.decodeQueueSize
+                requestIdr = true
+                this.lastBacklogResetAt = now
+                this.decodeBacklogSince = null
+                this.reset()
+                this.logger?.debug(`Video decoder backlog of ${queued} frames (~${Math.round(estimatedQueueDelayMs)} ms) persisted; resetting to the next key frame`)
+            }
+        } else {
+            this.decodeBacklogSince = null
         }
 
         if ("pollRequestIdr" in this.base && typeof this.base.pollRequestIdr == "function") {

@@ -5,6 +5,7 @@ import { getLanguageOptions, getTranslations, Language, normalizeLanguage } from
 import { Component, ComponentEvent } from "./index.js";
 import { InputComponent, SelectComponent } from "./input.js";
 import { SidebarEdge } from "./sidebar/index.js";
+import { WebTransportHostPreference, WebTransportPortPreference } from "../stream/transport/candidates.js";
 import {
     compareOutboxEnvelopes,
     createOutboxEnvelope,
@@ -45,6 +46,7 @@ export type Settings = {
     forceVideoElementRenderer: boolean
     canvasRenderer: boolean
     canvasVsync: boolean
+    videoFramePacing: FramePacingMode
     playAudioLocal: boolean
     encryptHostVideo: boolean
     encryptHostAudio: boolean
@@ -55,6 +57,8 @@ export type Settings = {
     localCursorSensitivity: number
     controllerConfig: ControllerConfig
     dataTransport: TransportType
+    webTransportHost: WebTransportHostPreference
+    webTransportPort: WebTransportPortPreference
     language: Language
     enterFullscreenOnStreamStart: boolean
     toggleFullscreenWithKeybind: boolean
@@ -67,7 +71,11 @@ export type StreamCodec = "h264" | "auto" | "h265" | "av1"
 export type TransportType = "auto" | "webtransport" | "webrtc" | "websocket"
 
 import DEFAULT_SETTINGS from "../default_settings.js"
+import { FramePacingMode } from "../stream/video/index.js";
 import { StreamPermissions } from "../api_bindings.js";
+
+// Upper end of the bitrate sliders when the role sets no limit.
+const MAX_BITRATE_KBPS = 100000
 
 /// You should use the role default settings instead!
 export function globalDefaultSettings(): Settings {
@@ -286,10 +294,6 @@ function mergeStreamSettings(defaultSettings: Settings, userSettings?: UserSetti
     if (settings?.pageStyle === "old") {
         settings.pageStyle = "moonlight"
     }
-    if (settings?.dataTransport === "webrtc") {
-        settings.dataTransport = "auto"
-    }
-
     return settings
 }
 
@@ -1030,12 +1034,6 @@ function settleSaveWaiters(state: SettingsSyncState, saved: boolean) {
 export type StreamSettingsChangeListener = (event: ComponentEvent<StreamSettingsComponent>) => void
 
 function makeSettingsValid(permissions: StreamPermissions, settings: Settings) {
-    // This low-latency fork no longer auto-selects or exposes WebRTC. Migrate a
-    // previously saved WebRTC choice to the new WebTransport-first Auto mode.
-    if (settings.dataTransport == "webrtc") {
-        settings.dataTransport = "auto"
-    }
-
     if (!Number.isFinite(settings.bitrate) || settings.bitrate <= 0) {
         settings.bitrate = globalDefaultSettings().bitrate
     }
@@ -1074,6 +1072,15 @@ function makeSettingsValid(permissions: StreamPermissions, settings: Settings) {
     if (!permissions.allow_transport_websockets && settings.dataTransport == "webtransport") {
         settings.dataTransport = "auto"
     }
+    if (!permissions.allow_transport_webrtc && settings.dataTransport == "webrtc") {
+        settings.dataTransport = "auto"
+    }
+    if (["auto", "primary", "alternate"].indexOf(settings.webTransportHost) == -1) {
+        settings.webTransportHost = "auto"
+    }
+    if (["auto", "443", "8443", "4443"].indexOf(settings.webTransportPort) == -1) {
+        settings.webTransportPort = "auto"
+    }
 
     if (!Number.isFinite(settings.localCursorSensitivity) || settings.localCursorSensitivity <= 0) {
         settings.localCursorSensitivity = globalDefaultSettings().localCursorSensitivity
@@ -1099,6 +1106,7 @@ export class StreamSettingsComponent implements Component {
     private forceVideoElementRenderer: InputComponent
     private canvasRenderer: InputComponent
     private canvasVsync: InputComponent
+    private videoFramePacing: SelectComponent
     private hdr: InputComponent
 
     private videoSize: SelectComponent
@@ -1124,6 +1132,8 @@ export class StreamSettingsComponent implements Component {
 
     private otherHeader: HTMLHeadingElement = document.createElement("h3")
     private dataTransport: SelectComponent
+    private webTransportHost: SelectComponent
+    private webTransportPort: SelectComponent
     private securityHeader: HTMLHeadingElement = document.createElement("h3")
     private securityWarning: HTMLParagraphElement = document.createElement("p")
     private encryptHostVideo: InputComponent
@@ -1180,7 +1190,7 @@ export class StreamSettingsComponent implements Component {
             step: "100",
             numberSlider: {
                 range_min: Math.min(this.permissions.maximum_bitrate_kbps ?? 1000, 1000),
-                range_max: this.permissions.maximum_bitrate_kbps ?? 10000,
+                range_max: this.permissions.maximum_bitrate_kbps ?? MAX_BITRATE_KBPS,
             }
         })
         this.bitrate.addChangeListener(this.onSettingsChange.bind(this))
@@ -1198,7 +1208,7 @@ export class StreamSettingsComponent implements Component {
             step: "100",
             numberSlider: {
                 range_min: Math.min(this.permissions.maximum_bitrate_kbps ?? 500, 500),
-                range_max: this.permissions.maximum_bitrate_kbps ?? defaultSettings_.bitrate,
+                range_max: this.permissions.maximum_bitrate_kbps ?? MAX_BITRATE_KBPS,
             }
         })
         this.minimumBitrate.addChangeListener(this.onSettingsChange.bind(this))
@@ -1305,6 +1315,18 @@ export class StreamSettingsComponent implements Component {
         })
         this.canvasVsync.addChangeListener(this.onSettingsChange.bind(this))
         this.canvasVsync.mount(this.divElement)
+
+        // Canvas frame pacing (Canvas only): adaptive jitter buffer for smoother motion
+        this.videoFramePacing = new SelectComponent("videoFramePacing", [
+            { value: "off", name: i.framePacingOff },
+            { value: "balanced", name: i.framePacingBalanced },
+            { value: "smooth", name: i.framePacingSmooth },
+        ], {
+            displayName: i.videoFramePacing,
+            preSelectedOption: settings?.videoFramePacing ?? defaultSettings_.videoFramePacing
+        })
+        this.videoFramePacing.addChangeListener(this.onSettingsChange.bind(this))
+        this.videoFramePacing.mount(this.divElement)
 
         // HDR
         this.hdr = new InputComponent("hdr", "checkbox", i.enableHdr, {
@@ -1448,6 +1470,9 @@ export class StreamSettingsComponent implements Component {
                 { value: "websocket", name: i.webSocket },
             )
         }
+        if (this.permissions.allow_transport_webrtc) {
+            allowedDataTransport.push({ value: "webrtc", name: "WebRTC" })
+        }
 
         this.language = new SelectComponent("language", getLanguageOptions(), {
             displayName: i.language,
@@ -1462,6 +1487,29 @@ export class StreamSettingsComponent implements Component {
         })
         this.dataTransport.addChangeListener(this.onSettingsChange.bind(this))
         this.dataTransport.mount(this.divElement)
+
+        this.webTransportHost = new SelectComponent("webTransportHost", [
+            { value: "auto", name: "Automatic (try both)" },
+            { value: "primary", name: "Primary hostname (sslip.io)" },
+            { value: "alternate", name: "Alternate hostname (nip.io)" },
+        ], {
+            displayName: "WebTransport Hostname",
+            preSelectedOption: settings?.webTransportHost ?? defaultSettings_.webTransportHost,
+        })
+        this.webTransportHost.addChangeListener(this.onSettingsChange.bind(this))
+        this.webTransportHost.mount(this.divElement)
+
+        this.webTransportPort = new SelectComponent("webTransportPort", [
+            { value: "auto", name: "Automatic (try all)" },
+            { value: "443", name: "UDP 443" },
+            { value: "8443", name: "UDP 8443" },
+            { value: "4443", name: "UDP 4443" },
+        ], {
+            displayName: "WebTransport Port",
+            preSelectedOption: settings?.webTransportPort ?? defaultSettings_.webTransportPort,
+        })
+        this.webTransportPort.addChangeListener(this.onSettingsChange.bind(this))
+        this.webTransportPort.mount(this.divElement)
 
         // Advanced security / performance. These controls affect only the
         // inner host-to-streamer Moonlight hop; WebTransport cannot disable TLS.
@@ -1557,6 +1605,7 @@ export class StreamSettingsComponent implements Component {
         settings.forceVideoElementRenderer = this.forceVideoElementRenderer.isChecked()
         settings.canvasRenderer = this.canvasRenderer.isChecked()
         settings.canvasVsync = this.canvasVsync.isChecked()
+        settings.videoFramePacing = (this.videoFramePacing.getValue() ?? DEFAULT_SETTINGS.videoFramePacing) as FramePacingMode
 
         settings.playAudioLocal = this.playAudioLocal.isChecked()
         settings.encryptHostVideo = this.encryptHostVideo.isChecked()
@@ -1577,6 +1626,8 @@ export class StreamSettingsComponent implements Component {
         }
 
         settings.dataTransport = this.dataTransport.getValue() as any
+        settings.webTransportHost = this.webTransportHost.getValue() as WebTransportHostPreference
+        settings.webTransportPort = this.webTransportPort.getValue() as WebTransportPortPreference
         settings.language = this.language.getValue() as Language
 
         settings.enterFullscreenOnStreamStart = this.enterFullscreenOnStreamStart.isChecked()

@@ -16,6 +16,7 @@ use crate::api::{
 
 pub mod app;
 pub mod auth;
+pub mod client_log;
 pub mod host;
 pub mod low_latency_ws;
 pub mod role;
@@ -77,4 +78,5 @@ pub fn api_service() -> impl HttpServiceFactory {
             stream::start_host,
             stream::cancel_host,
         ])
+        .service(client_log::post_client_log)
 }

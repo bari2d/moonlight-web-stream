@@ -41,9 +41,11 @@ const IPC_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 /// independent from realtime media so video congestion cannot delay Stop,
 /// setup, input, or RTT messages.
 const IPC_RELIABLE_QUEUE_CAPACITY: usize = 16;
-/// Short realtime queue used by audio. It is drained before low-priority video,
-/// but remains bounded so stale audio cannot accumulate latency.
-const IPC_REALTIME_QUEUE_CAPACITY: usize = 4;
+/// Short realtime queue used by audio. It is drained before low-priority video.
+/// One already-started multi-megabyte pipe write cannot be preempted, so retain
+/// enough tiny Opus packets to bridge that write without silently breaking the
+/// decoder's prediction chain.
+const IPC_REALTIME_QUEUE_CAPACITY: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamerConfig {

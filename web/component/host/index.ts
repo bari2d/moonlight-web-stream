@@ -136,13 +136,6 @@ export class Host implements Component {
             }
         }
 
-        if (this.cache?.owner == "ThisUser" || this.userCache?.role == "Admin") {
-            elements.push({
-                name: i.removeHost,
-                callback: this.remove.bind(this)
-            })
-        }
-
         setContextMenu(event, {
             elements
         })
